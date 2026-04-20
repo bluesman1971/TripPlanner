@@ -1,10 +1,42 @@
+import { Routes, Route, Navigate } from 'react-router-dom';
+import { useAuth } from '@clerk/react';
+import { AppShell } from './components/layout/AppShell';
+import { SignInPage } from './pages/SignInPage';
+import { DashboardPage } from './pages/DashboardPage';
+import { LoadingSpinner } from './components/ui/LoadingSpinner';
+
+/** Wraps routes that require authentication. */
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { isSignedIn, isLoaded } = useAuth();
+
+  if (!isLoaded) return <LoadingSpinner message="Checking auth…" />;
+  if (!isSignedIn) return <Navigate to="/sign-in" replace />;
+
+  return <>{children}</>;
+}
+
 export default function App() {
   return (
-    <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-      <div className="text-center">
-        <h1 className="text-2xl font-semibold text-gray-900">Trip Planner</h1>
-        <p className="mt-2 text-gray-500">Sprint 1 — Foundation</p>
-      </div>
-    </div>
+    <Routes>
+      {/* Public */}
+      <Route path="/sign-in/*" element={<SignInPage />} />
+
+      {/* Protected — all inside the app shell */}
+      <Route
+        element={
+          <ProtectedRoute>
+            <AppShell />
+          </ProtectedRoute>
+        }
+      >
+        <Route index element={<DashboardPage />} />
+        <Route path="trips/:id" element={<div className="text-gray-500">Trip detail — coming soon</div>} />
+        <Route path="trips/new"  element={<div className="text-gray-500">New trip wizard — coming soon</div>} />
+        <Route path="clients"    element={<div className="text-gray-500">Clients — coming soon</div>} />
+      </Route>
+
+      {/* Fallback */}
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 }
