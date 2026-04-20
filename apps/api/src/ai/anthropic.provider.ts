@@ -16,7 +16,7 @@ export class AnthropicProvider implements AIProvider {
       max_tokens: prompt.maxTokens ?? 4096,
       system: prompt.system,
       messages: prompt.messages,
-      ...(opts.tools ? { tools: opts.tools as Anthropic.Tool[] } : {}),
+      ...(opts.tools ? { tools: opts.tools as unknown as Anthropic.Tool[] } : {}),
     });
 
     const textBlock = response.content.find((b) => b.type === 'text');
@@ -35,7 +35,7 @@ export class AnthropicProvider implements AIProvider {
       max_tokens: prompt.maxTokens ?? 8192,
       system: prompt.system,
       messages: prompt.messages,
-      ...(opts.tools ? { tools: opts.tools as Anthropic.Tool[] } : {}),
+      ...(opts.tools ? { tools: opts.tools as unknown as Anthropic.Tool[] } : {}),
     });
 
     for await (const chunk of stream) {
