@@ -2,6 +2,7 @@ import { Worker, type Job } from 'bullmq';
 import { unlinkSync } from 'fs';
 import { getRedis } from '../lib/redis';
 import { getSupabase } from '../lib/supabase';
+import { downloadFromR2ToTemp } from '../lib/r2';
 import { extractText } from '../services/extractor';
 import { parseBookingDocument } from '../services/bookingParser';
 import { type IngestJobData, type IngestJobResult, INGEST_QUEUE_NAME } from '../queues/ingest.queue';
@@ -9,19 +10,23 @@ import { type IngestJobData, type IngestJobResult, INGEST_QUEUE_NAME } from '../
 async function processIngestJob(
   job: Job<IngestJobData, IngestJobResult>,
 ): Promise<IngestJobResult> {
-  const { tripId, filePath, originalFilename, isImage } = job.data;
+  const { tripId, r2Key, originalFilename, isImage } = job.data;
   const supabase = getSupabase();
+  let tempPath: string | null = null;
 
   try {
-    // ── Step 1: Extract text ──────────────────────────────────────────────
+    // ── Step 1: Download from R2 to temp file ─────────────────────────────
+    tempPath = await downloadFromR2ToTemp(r2Key);
+
+    // ── Step 2: Extract text ──────────────────────────────────────────────
     let rawText: string;
 
     if (isImage) {
-      // Image-based PDFs: for now record that vision processing is needed.
-      // Full vision support added in Week 5 with R2 integration.
+      // Image files are sent to Claude vision directly using the file buffer.
+      // For now, flag it — full vision pipeline added in Sprint 3.
       rawText = `[IMAGE FILE: ${originalFilename}] — Vision-based extraction not yet implemented. Upload a text-based PDF or document instead.`;
     } else {
-      const extracted = await extractText(filePath);
+      const extracted = await extractText(tempPath);
       if (!extracted || extracted.trim().length < 50) {
         throw new Error(
           `Could not extract readable text from ${originalFilename}. ` +
@@ -73,8 +78,10 @@ async function processIngestJob(
     return { bookingId: booking.id, bookingSlug: booking.booking_slug };
 
   } finally {
-    // Always clean up the temp file
-    try { unlinkSync(filePath); } catch { /* ignore */ }
+    // Always clean up the local temp file (R2 copy is kept for re-ingestion)
+    if (tempPath) {
+      try { unlinkSync(tempPath); } catch { /* ignore */ }
+    }
   }
 }
 

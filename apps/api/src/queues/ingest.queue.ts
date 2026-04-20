@@ -6,8 +6,8 @@ import { getRedis } from '../lib/redis';
 export interface IngestJobData {
   tripId: string;
   consultantId: string;
-  /** Absolute path to the temp file written during upload */
-  filePath: string;
+  /** R2 key where the uploaded file is stored — e.g. bookings/{tripId}/{uuid}.pdf */
+  r2Key: string;
   originalFilename: string;
   mimeType: string;
   /** True for .png/.jpg/.jpeg/.webp — AI uses vision instead of text extraction */

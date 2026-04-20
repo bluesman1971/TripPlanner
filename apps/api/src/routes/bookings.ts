@@ -1,11 +1,9 @@
 import type { FastifyInstance } from 'fastify';
-import { writeFileSync } from 'fs';
-import { tmpdir } from 'os';
 import path from 'path';
-import { randomUUID } from 'crypto';
 import { getAuth } from '@clerk/fastify';
 import { getSupabase } from '../lib/supabase';
 import { getOrCreateConsultant } from '../lib/consultant';
+import { uploadToR2 } from '../lib/r2';
 import { getIngestQueue } from '../queues/ingest.queue';
 import { isImageFile } from '../services/extractor';
 import { requireAuth } from '../middleware/auth';
@@ -69,16 +67,24 @@ export async function bookingRoutes(app: FastifyInstance) {
       }
       const buffer = Buffer.concat(chunks);
 
-      // Write to a temp file — the worker reads it from there
-      const tempPath = path.join(tmpdir(), `ingest-${randomUUID()}${ext}`);
-      writeFileSync(tempPath, buffer);
+      // Upload to R2 for durable storage (worker downloads from here)
+      const r2Key = await uploadToR2(buffer, originalFilename, tripId, data.mimetype);
+
+      // Record the upload in the documents table
+      const supabaseForDoc = getSupabase();
+      await supabaseForDoc.from('documents').insert({
+        trip_id: tripId,
+        doc_type: 'booking_upload',
+        r2_key: r2Key,
+        original_filename: originalFilename,
+      });
 
       // Enqueue the ingest job
       const queue = getIngestQueue();
       const job = await queue.add('ingest', {
         tripId,
         consultantId: consultant.id,
-        filePath: tempPath,
+        r2Key,
         originalFilename,
         mimeType: data.mimetype,
         isImage: isImageFile(originalFilename),
