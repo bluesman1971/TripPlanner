@@ -6,6 +6,8 @@ import { getOrCreateConsultant } from '../lib/consultant';
 import { uploadToR2 } from '../lib/r2';
 import { getIngestQueue } from '../queues/ingest.queue';
 import { isImageFile } from '../services/extractor';
+import { decryptJson, isEncrypted } from '../lib/encryption';
+import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
 
 const ALLOWED_EXTENSIONS = new Set([
@@ -166,11 +168,21 @@ export async function bookingRoutes(app: FastifyInstance) {
         .order('date', { ascending: true });
 
       if (error) {
-        app.log.error(error);
+        app.log.error(safeError(error));
         return reply.status(500).send({ error: 'Failed to fetch bookings' });
       }
 
-      return reply.send(data ?? []);
+      // Decrypt sensitive fields before returning to caller
+      type BookingRow = { allergy_flags?: string | null; [key: string]: unknown };
+      const rows = (data as unknown as BookingRow[]) ?? [];
+      const decrypted = rows.map((booking) => ({
+        ...booking,
+        allergy_flags: booking.allergy_flags && isEncrypted(booking.allergy_flags)
+          ? decryptJson(booking.allergy_flags)
+          : booking.allergy_flags,
+      }));
+
+      return reply.send(decrypted);
     },
   );
 }

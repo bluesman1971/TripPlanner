@@ -5,6 +5,8 @@ import { getSupabase } from '../lib/supabase';
 import { downloadFromR2ToTemp } from '../lib/r2';
 import { extractText } from '../services/extractor';
 import { parseBookingDocument } from '../services/bookingParser';
+import { encryptJson, encrypt } from '../lib/encryption';
+import { safeError } from '../lib/logger';
 import { type IngestJobData, type IngestJobResult, INGEST_QUEUE_NAME } from '../queues/ingest.queue';
 
 async function processIngestJob(
@@ -22,15 +24,14 @@ async function processIngestJob(
     let rawText: string;
 
     if (isImage) {
-      // Image files are sent to Claude vision directly using the file buffer.
-      // For now, flag it — full vision pipeline added in Sprint 3.
-      rawText = `[IMAGE FILE: ${originalFilename}] — Vision-based extraction not yet implemented. Upload a text-based PDF or document instead.`;
+      // Image files need Claude vision — full pipeline added in Sprint 3.
+      rawText = '[IMAGE FILE] — Vision-based extraction not yet implemented. Upload a text-based PDF or document instead.';
     } else {
       const extracted = await extractText(tempPath);
       if (!extracted || extracted.trim().length < 50) {
         throw new Error(
-          `Could not extract readable text from ${originalFilename}. ` +
-          `The file may be a scanned/image PDF. Try uploading a text-based version.`,
+          `Could not extract readable text from the uploaded file. ` +
+          `It may be a scanned/image PDF. Try uploading a text-based version.`,
         );
       }
       rawText = extracted;
@@ -38,12 +39,19 @@ async function processIngestJob(
 
     await job.updateProgress(40);
 
-    // ── Step 2: AI parsing ────────────────────────────────────────────────
+    // ── Step 3: AI parsing ────────────────────────────────────────────────
     const parsed = await parseBookingDocument(rawText);
 
     await job.updateProgress(80);
 
-    // ── Step 3: Upsert booking row ────────────────────────────────────────
+    // ── Step 4: Encrypt sensitive fields before DB insert ─────────────────
+    // allergy_flags and raw_text contain medical PII — encrypted at application level.
+    const encryptedAllergyFlags = parsed.allergy_flags
+      ? encryptJson(parsed.allergy_flags)
+      : null;
+    const encryptedRawText = encrypt(rawText);
+
+    // ── Step 5: Upsert booking row ────────────────────────────────────────
     const { data: booking, error } = await supabase
       .from('bookings')
       .upsert(
@@ -59,9 +67,9 @@ async function processIngestJob(
           drop_off_address:      parsed.drop_off_address ?? '',
           included_meals:        parsed.included_meals,
           included_transport:    parsed.included_transport,
-          allergy_flags:         parsed.allergy_flags,
-          consultant_flags:      parsed.consultant_flags,
-          raw_text:              rawText,
+          allergy_flags:         encryptedAllergyFlags,  // encrypted
+          consultant_flags:      parsed.consultant_flags, // not PII — action items only
+          raw_text:              encryptedRawText,        // encrypted
           ingested_at:           new Date().toISOString(),
         },
         { onConflict: 'trip_id,booking_slug' },
@@ -70,7 +78,7 @@ async function processIngestJob(
       .single();
 
     if (error || !booking) {
-      throw new Error(`Failed to save booking: ${error?.message ?? 'unknown error'}`);
+      throw new Error(`Failed to save booking: ${safeError(error).message}`);
     }
 
     await job.updateProgress(100);
@@ -98,11 +106,13 @@ export function startIngestWorker(): Worker<IngestJobData, IngestJobResult> {
   );
 
   worker.on('completed', (job, result) => {
-    console.log(`[ingest] Job ${job.id} completed — booking: ${result.bookingSlug}`);
+    // Log job ID and slug only — no PII
+    console.log(`[ingest] Job ${job.id} completed — slug: ${result.bookingSlug}`);
   });
 
   worker.on('failed', (job, err) => {
-    console.error(`[ingest] Job ${job?.id} failed:`, err.message);
+    // Log job ID and safe error message only — never the full error object
+    console.error(`[ingest] Job ${job?.id} failed: ${safeError(err).message}`);
   });
 
   return worker;

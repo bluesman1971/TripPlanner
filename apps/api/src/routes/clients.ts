@@ -3,6 +3,7 @@ import { getAuth } from '@clerk/fastify';
 import { z } from 'zod';
 import { getSupabase } from '../lib/supabase';
 import { getOrCreateConsultant } from '../lib/consultant';
+import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
 
 const CreateClientSchema = z.object({
@@ -33,7 +34,7 @@ export async function clientRoutes(app: FastifyInstance) {
       .single();
 
     if (error) {
-      app.log.error(error);
+      app.log.error(safeError(error));
       return reply.status(500).send({ error: 'Failed to create client' });
     }
 
@@ -53,7 +54,7 @@ export async function clientRoutes(app: FastifyInstance) {
       .order('created_at', { ascending: false });
 
     if (error) {
-      app.log.error(error);
+      app.log.error(safeError(error));
       return reply.status(500).send({ error: 'Failed to fetch clients' });
     }
 

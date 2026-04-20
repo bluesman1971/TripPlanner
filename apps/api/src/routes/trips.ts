@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { TripPurposeSchema, TripStatusSchema, DiscoverySchema } from '@trip-planner/shared';
 import { getSupabase } from '../lib/supabase';
 import { getOrCreateConsultant } from '../lib/consultant';
+import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
 
 // ─── Request schemas ──────────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ export async function tripRoutes(app: FastifyInstance) {
       .order('created_at', { ascending: false });
 
     if (error) {
-      app.log.error(error);
+      app.log.error(safeError(error));
       return reply.status(500).send({ error: 'Failed to fetch trips' });
     }
 
@@ -133,7 +134,7 @@ export async function tripRoutes(app: FastifyInstance) {
       .single();
 
     if (tripError || !trip) {
-      app.log.error(tripError);
+      app.log.error(safeError(tripError));
       return reply.status(500).send({ error: 'Failed to create trip' });
     }
 
@@ -279,7 +280,7 @@ export async function tripRoutes(app: FastifyInstance) {
       .single();
 
     if (error) {
-      app.log.error(error);
+      app.log.error(safeError(error));
       return reply.status(500).send({ error: 'Failed to update brief' });
     }
 
