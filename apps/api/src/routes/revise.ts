@@ -8,15 +8,9 @@ import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
 import { REVISION_SYSTEM_PROMPT, buildRevisionUserMessage } from '../services/revisionPrompt';
 import { fitToTokenBudget, CONTEXT_BUDGETS } from '../services/contextManager';
+import { startSSE, REPLAY_CHUNK_SIZE } from '../lib/sse';
 
 const provider = new AnthropicProvider();
-
-const PING_INTERVAL_MS = 15_000;
-const REPLAY_CHUNK_SIZE = 512;
-
-function writeSSE(raw: NodeJS.WritableStream, event: Record<string, unknown>) {
-  raw.write(`data: ${JSON.stringify(event)}\n\n`);
-}
 
 const ALLOWED_STATUSES = ['draft', 'review', 'complete'];
 
@@ -55,22 +49,12 @@ export async function revisionRoutes(app: FastifyInstance) {
 
         if (savedVersion?.markdown_content) {
           const tail = savedVersion.markdown_content.slice(resumeOffset);
-          reply.raw.setHeader('Content-Type', 'text/event-stream');
-          reply.raw.setHeader('Cache-Control', 'no-cache');
-          reply.raw.setHeader('Connection', 'keep-alive');
-          reply.raw.setHeader('X-Accel-Buffering', 'no');
-          reply.raw.setHeader(
-            'Access-Control-Allow-Origin',
-            process.env.CORS_ORIGIN || 'http://localhost:5174',
-          );
-          reply.hijack();
-          reply.raw.flushHeaders();
-
+          const sse = startSSE(reply, request);
           for (let i = 0; i < tail.length; i += REPLAY_CHUNK_SIZE) {
-            writeSSE(reply.raw, { type: 'chunk', text: tail.slice(i, i + REPLAY_CHUNK_SIZE) });
+            sse.writeEvent({ type: 'chunk', text: tail.slice(i, i + REPLAY_CHUNK_SIZE) });
           }
-          writeSSE(reply.raw, { type: 'done', versionNumber: savedVersion.version_number });
-          reply.raw.end();
+          sse.writeEvent({ type: 'done', versionNumber: savedVersion.version_number });
+          sse.end();
           return;
         }
         // No saved version — fall through to gate + fresh generation
@@ -142,27 +126,10 @@ export async function revisionRoutes(app: FastifyInstance) {
       });
 
       // ── Switch to SSE ─────────────────────────────────────────────────────
-      reply.raw.setHeader('Content-Type', 'text/event-stream');
-      reply.raw.setHeader('Cache-Control', 'no-cache');
-      reply.raw.setHeader('Connection', 'keep-alive');
-      reply.raw.setHeader('X-Accel-Buffering', 'no');
-      reply.raw.setHeader(
-        'Access-Control-Allow-Origin',
-        process.env.CORS_ORIGIN || 'http://localhost:5174',
-      );
-
-      reply.hijack();
-      reply.raw.flushHeaders();
+      const sse = startSSE(reply, request);
 
       let fullContent = '';
       let firstChunk = true;
-      let pingTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
-        if (firstChunk) writeSSE(reply.raw, { type: 'ping' });
-      }, PING_INTERVAL_MS);
-
-      const stopPing = () => {
-        if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
-      };
 
       try {
         const handle = provider.streamWithUsage(
@@ -175,41 +142,42 @@ export async function revisionRoutes(app: FastifyInstance) {
         );
 
         for await (const chunk of handle) {
-          if (firstChunk) { firstChunk = false; stopPing(); }
+          if (sse.isAborted()) break;
+          if (firstChunk) { firstChunk = false; sse.onFirstChunk(); }
           fullContent += chunk.text;
-          writeSSE(reply.raw, { type: 'chunk', text: chunk.text });
+          sse.writeEvent({ type: 'chunk', text: chunk.text });
         }
 
-        const usage = await handle.getUsage();
+        // Skip all side-effects if the client disconnected mid-generation
+        if (!sse.isAborted()) {
+          const usage = await handle.getUsage();
 
-        // ── Save as new version (never overwrite) ─────────────────────────────
-        await supabase
-          .from('itinerary_versions')
-          .insert({
-            trip_id: tripId,
-            version_number: nextVersionNumber,
-            markdown_content: fullContent,
-            input_tokens: usage.inputTokens,
-            output_tokens: usage.outputTokens,
-            model_used: usage.model,
-          });
-
-        // ── Advance status to 'review' if it was still 'draft' ────────────────
-        if (trip.status === 'draft') {
           await supabase
-            .from('trips')
-            .update({ status: 'review', updated_at: new Date().toISOString() })
-            .eq('id', tripId);
-        }
+            .from('itinerary_versions')
+            .insert({
+              trip_id: tripId,
+              version_number: nextVersionNumber,
+              markdown_content: fullContent,
+              input_tokens: usage.inputTokens,
+              output_tokens: usage.outputTokens,
+              model_used: usage.model,
+            });
 
-        writeSSE(reply.raw, { type: 'done', versionNumber: nextVersionNumber });
+          if (trip.status === 'draft') {
+            await supabase
+              .from('trips')
+              .update({ status: 'review', updated_at: new Date().toISOString() })
+              .eq('id', tripId);
+          }
+
+          sse.writeEvent({ type: 'done', versionNumber: nextVersionNumber });
+        }
 
       } catch (err) {
         app.log.error(safeError(err));
-        writeSSE(reply.raw, { type: 'error', message: 'Revision failed. Please try again.' });
+        sse.writeEvent({ type: 'error', message: 'Revision failed. Please try again.' });
       } finally {
-        stopPing();
-        reply.raw.end();
+        sse.end();
       }
     },
   );

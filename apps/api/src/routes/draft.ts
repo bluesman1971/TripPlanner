@@ -9,15 +9,9 @@ import { requireAuth } from '../middleware/auth';
 import { DRAFT_SYSTEM_PROMPT, buildDraftUserMessage } from '../services/draftPrompt';
 import { fitToTokenBudget, CONTEXT_BUDGETS } from '../services/contextManager';
 import { sendDraftReadyEmail } from '../services/email';
+import { startSSE, REPLAY_CHUNK_SIZE } from '../lib/sse';
 
 const provider = new AnthropicProvider();
-
-const PING_INTERVAL_MS = 15_000;
-const REPLAY_CHUNK_SIZE = 512;
-
-function writeSSE(raw: NodeJS.WritableStream, event: Record<string, unknown>) {
-  raw.write(`data: ${JSON.stringify(event)}\n\n`);
-}
 
 const DRAFT_TRIP_SELECT =
   'id, destination, destination_country, departure_city, start_date, end_date, duration_days, purpose, purpose_notes, status, clients!inner(consultant_id)';
@@ -58,22 +52,12 @@ export async function draftRoutes(app: FastifyInstance) {
 
         if (savedVersion?.markdown_content) {
           const tail = savedVersion.markdown_content.slice(resumeOffset);
-          reply.raw.setHeader('Content-Type', 'text/event-stream');
-          reply.raw.setHeader('Cache-Control', 'no-cache');
-          reply.raw.setHeader('Connection', 'keep-alive');
-          reply.raw.setHeader('X-Accel-Buffering', 'no');
-          reply.raw.setHeader(
-            'Access-Control-Allow-Origin',
-            process.env.CORS_ORIGIN || 'http://localhost:5174',
-          );
-          reply.hijack();
-          reply.raw.flushHeaders();
-
+          const sse = startSSE(reply, request);
           for (let i = 0; i < tail.length; i += REPLAY_CHUNK_SIZE) {
-            writeSSE(reply.raw, { type: 'chunk', text: tail.slice(i, i + REPLAY_CHUNK_SIZE) });
+            sse.writeEvent({ type: 'chunk', text: tail.slice(i, i + REPLAY_CHUNK_SIZE) });
           }
-          writeSSE(reply.raw, { type: 'done', versionNumber: savedVersion.version_number });
-          reply.raw.end();
+          sse.writeEvent({ type: 'done', versionNumber: savedVersion.version_number });
+          sse.end();
           return;
         }
         // No saved draft — fall through to gate check + fresh generation
@@ -155,27 +139,10 @@ export async function draftRoutes(app: FastifyInstance) {
       });
 
       // ── Switch to SSE ─────────────────────────────────────────────────────
-      reply.raw.setHeader('Content-Type', 'text/event-stream');
-      reply.raw.setHeader('Cache-Control', 'no-cache');
-      reply.raw.setHeader('Connection', 'keep-alive');
-      reply.raw.setHeader('X-Accel-Buffering', 'no');
-      reply.raw.setHeader(
-        'Access-Control-Allow-Origin',
-        process.env.CORS_ORIGIN || 'http://localhost:5174',
-      );
-
-      reply.hijack();
-      reply.raw.flushHeaders();
+      const sse = startSSE(reply, request);
 
       let fullContent = '';
       let firstChunk = true;
-      let pingTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
-        if (firstChunk) writeSSE(reply.raw, { type: 'ping' });
-      }, PING_INTERVAL_MS);
-
-      const stopPing = () => {
-        if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
-      };
 
       try {
         const handle = provider.streamWithUsage(
@@ -188,46 +155,47 @@ export async function draftRoutes(app: FastifyInstance) {
         );
 
         for await (const chunk of handle) {
-          if (firstChunk) { firstChunk = false; stopPing(); }
+          if (sse.isAborted()) break;
+          if (firstChunk) { firstChunk = false; sse.onFirstChunk(); }
           fullContent += chunk.text;
-          writeSSE(reply.raw, { type: 'chunk', text: chunk.text });
+          sse.writeEvent({ type: 'chunk', text: chunk.text });
         }
 
-        const usage = await handle.getUsage();
+        // Skip all side-effects if the client disconnected mid-generation
+        if (!sse.isAborted()) {
+          const usage = await handle.getUsage();
 
-        // ── Save draft version (never overwrite — always new version) ─────────
-        await supabase
-          .from('itinerary_versions')
-          .insert({
-            trip_id: tripId,
-            version_number: nextVersionNumber,
-            markdown_content: fullContent,
-            input_tokens: usage.inputTokens,
-            output_tokens: usage.outputTokens,
-            model_used: usage.model,
-          });
+          await supabase
+            .from('itinerary_versions')
+            .insert({
+              trip_id: tripId,
+              version_number: nextVersionNumber,
+              markdown_content: fullContent,
+              input_tokens: usage.inputTokens,
+              output_tokens: usage.outputTokens,
+              model_used: usage.model,
+            });
 
-        // ── Advance trip status ───────────────────────────────────────────────
-        await supabase
-          .from('trips')
-          .update({ status: 'draft', updated_at: new Date().toISOString() })
-          .eq('id', tripId);
+          await supabase
+            .from('trips')
+            .update({ status: 'draft', updated_at: new Date().toISOString() })
+            .eq('id', tripId);
 
-        // Fire-and-forget — email failure must never disrupt the SSE stream
-        sendDraftReadyEmail(
-          consultant,
-          { id: tripId, destination: trip.destination as string },
-          nextVersionNumber,
-        );
+          // Fire-and-forget — email failure must never disrupt the SSE stream
+          sendDraftReadyEmail(
+            consultant,
+            { id: tripId, destination: trip.destination as string },
+            nextVersionNumber,
+          );
 
-        writeSSE(reply.raw, { type: 'done', versionNumber: nextVersionNumber });
+          sse.writeEvent({ type: 'done', versionNumber: nextVersionNumber });
+        }
 
       } catch (err) {
         app.log.error(safeError(err));
-        writeSSE(reply.raw, { type: 'error', message: 'Draft generation failed. Please try again.' });
+        sse.writeEvent({ type: 'error', message: 'Draft generation failed. Please try again.' });
       } finally {
-        stopPing();
-        reply.raw.end();
+        sse.end();
       }
     },
   );
