@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { buildApp } from './app';
 import { startIngestWorker } from './workers/ingest.worker';
 
