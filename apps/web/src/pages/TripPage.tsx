@@ -1178,7 +1178,8 @@ function RevisionPanel({ trip }: { trip: TripDetail }) {
 
 type DocumentState =
   | { phase: 'idle' }
-  | { phase: 'generating' }
+  | { phase: 'queued'; jobId: string }
+  | { phase: 'generating'; jobId: string }
   | { phase: 'done'; versionNumber: number; downloadPath: string }
   | { phase: 'error'; message: string };
 
@@ -1188,11 +1189,20 @@ interface DocumentInfo {
   downloadPath: string;
 }
 
+interface DocJobStatus {
+  status: 'waiting' | 'active' | 'completed' | 'failed' | string;
+  result?: { versionNumber: number; downloadPath: string };
+  error?: string;
+}
+
+const DOC_POLL_INTERVAL = 2000;
+
 function DocumentPanel({ trip }: { trip: TripDetail }) {
   const { apiFetch, apiDownload } = useApi();
   const queryClient = useQueryClient();
   const [state, setState] = useState<DocumentState>({ phase: 'idle' });
   const [downloading, setDownloading] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const docStatuses = ['draft', 'review', 'complete'];
   const canGenerate = docStatuses.includes(trip.status);
@@ -1203,21 +1213,51 @@ function DocumentPanel({ trip }: { trip: TripDetail }) {
     enabled: canGenerate,
   });
 
+  // Stop polling on unmount
+  useEffect(() => {
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, []);
+
+  const startPolling = useCallback((jobId: string) => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      try {
+        const status = await apiFetch<DocJobStatus>(`/trips/${trip.id}/document/job/${jobId}`);
+        if (status.status === 'completed' && status.result) {
+          stopPolling();
+          setState({ phase: 'done', versionNumber: status.result.versionNumber, downloadPath: status.result.downloadPath });
+          queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
+          queryClient.invalidateQueries({ queryKey: ['document', trip.id] });
+        } else if (status.status === 'failed') {
+          stopPolling();
+          setState({ phase: 'error', message: status.error ?? 'Document generation failed.' });
+        } else if (status.status === 'active') {
+          setState({ phase: 'generating', jobId });
+        }
+      } catch {
+        // Transient poll error — keep polling
+      }
+    }, DOC_POLL_INTERVAL);
+  }, [trip.id, apiFetch, queryClient, stopPolling]);
+
   const handleGenerate = useCallback(async () => {
-    setState({ phase: 'generating' });
+    setState({ phase: 'queued', jobId: '' });
     try {
-      const res = await apiFetch<{ versionNumber: number; downloadPath: string }>(
+      const res = await apiFetch<{ jobId: string }>(
         `/trips/${trip.id}/document`,
         { method: 'POST' },
       );
-      setState({ phase: 'done', versionNumber: res.versionNumber, downloadPath: res.downloadPath });
-      queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-      queryClient.invalidateQueries({ queryKey: ['document', trip.id] });
+      setState({ phase: 'queued', jobId: res.jobId });
+      startPolling(res.jobId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Document generation failed';
       setState({ phase: 'error', message: msg });
     }
-  }, [trip.id, apiFetch, queryClient]);
+  }, [trip.id, apiFetch, startPolling]);
 
   const handleDownload = useCallback(
     async (downloadPath: string, versionNumber: number) => {
@@ -1257,8 +1297,10 @@ function DocumentPanel({ trip }: { trip: TripDetail }) {
           </button>
         )}
 
-        {state.phase === 'generating' && (
-          <span className="text-xs text-gray-400 animate-pulse">Generating…</span>
+        {(state.phase === 'queued' || state.phase === 'generating') && (
+          <span className="text-xs text-gray-400 animate-pulse">
+            {state.phase === 'queued' ? 'Queued…' : 'Generating…'}
+          </span>
         )}
 
         {state.phase === 'done' && (
@@ -1279,7 +1321,13 @@ function DocumentPanel({ trip }: { trip: TripDetail }) {
           </p>
         )}
 
-        {displayDoc && (
+        {(state.phase === 'queued' || state.phase === 'generating') && (
+          <p className="text-sm text-gray-400 animate-pulse">
+            Building your Word document — this may take up to 30 seconds for long itineraries.
+          </p>
+        )}
+
+        {displayDoc && state.phase !== 'queued' && state.phase !== 'generating' && (
           <div className="flex items-center gap-4">
             <span className="text-sm text-gray-700">
               v{displayDoc.versionNumber} — itinerary-v{displayDoc.versionNumber}.docx
@@ -1324,6 +1372,7 @@ type ShareState =
   | { phase: 'idle' }
   | { phase: 'loading' }
   | { phase: 'done'; portalUrl: string; copied: boolean }
+  | { phase: 'revoking'; portalUrl: string }
   | { phase: 'error'; message: string };
 
 function ShareButton({ tripId }: { tripId: string }) {
@@ -1353,6 +1402,17 @@ function ShareButton({ tripId }: { tripId: string }) {
     }
   };
 
+  const handleRevoke = async (portalUrl: string) => {
+    if (!confirm('Revoke this link? The client will no longer be able to access the portal with this URL.')) return;
+    setState({ phase: 'revoking', portalUrl });
+    try {
+      await apiFetch(`/trips/${tripId}/portal/token`, { method: 'DELETE' });
+      setState({ phase: 'idle' });
+    } catch {
+      setState({ phase: 'done', portalUrl, copied: false });
+    }
+  };
+
   if (state.phase === 'idle' || state.phase === 'loading' || state.phase === 'error') {
     return (
       <div className="flex flex-col items-end gap-1">
@@ -1370,29 +1430,43 @@ function ShareButton({ tripId }: { tripId: string }) {
     );
   }
 
+  const portalUrl = state.portalUrl;
+  const isRevoking = state.phase === 'revoking';
+
   return (
     <div className="flex flex-col items-end gap-1.5">
-      <p className="text-xs text-gray-400">Client portal link</p>
+      <p className="text-xs text-gray-400">Client portal link (expires in 90 days)</p>
       <div className="flex items-center gap-2">
         <input
           readOnly
-          value={state.portalUrl}
+          value={portalUrl}
           className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1 w-64 truncate"
           onFocus={(e) => e.target.select()}
         />
         <button
-          onClick={() => handleCopy(state.portalUrl)}
-          className="text-xs px-2 py-1 bg-gray-900 hover:bg-gray-700 text-white rounded transition-colors"
+          onClick={() => handleCopy(portalUrl)}
+          disabled={isRevoking}
+          className="text-xs px-2 py-1 bg-gray-900 hover:bg-gray-700 disabled:opacity-50 text-white rounded transition-colors"
         >
-          {state.copied ? 'Copied!' : 'Copy'}
+          {state.phase === 'done' && state.copied ? 'Copied!' : 'Copy'}
         </button>
       </div>
-      <button
-        onClick={() => setState({ phase: 'idle' })}
-        className="text-xs text-gray-400 hover:text-gray-600"
-      >
-        Generate another
-      </button>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => setState({ phase: 'idle' })}
+          disabled={isRevoking}
+          className="text-xs text-gray-400 hover:text-gray-600 disabled:opacity-50"
+        >
+          Generate another
+        </button>
+        <button
+          onClick={() => handleRevoke(portalUrl)}
+          disabled={isRevoking}
+          className="text-xs text-red-400 hover:text-red-600 disabled:opacity-50"
+        >
+          {isRevoking ? 'Revoking…' : 'Revoke link'}
+        </button>
+      </div>
     </div>
   );
 }

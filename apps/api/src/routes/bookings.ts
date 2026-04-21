@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import path from 'path';
 import { getAuth } from '@clerk/fastify';
-import { getSupabase } from '../lib/supabase';
+import { getDB } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { uploadToR2 } from '../lib/r2';
 import { getIngestQueue } from '../queues/ingest.queue';
@@ -28,7 +28,7 @@ export async function bookingRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { tripId } = request.params as { tripId: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
       // Verify the trip belongs to this consultant
@@ -80,8 +80,7 @@ export async function bookingRoutes(app: FastifyInstance) {
       const r2Key = await uploadToR2(buffer, originalFilename, tripId, data.mimetype);
 
       // Record the upload in the documents table
-      const supabaseForDoc = getSupabase();
-      await supabaseForDoc.from('documents').insert({
+      await supabase.from('documents').insert({
         trip_id: tripId,
         doc_type: 'booking_upload',
         r2_key: r2Key,
@@ -149,7 +148,7 @@ export async function bookingRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { tripId } = request.params as { tripId: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
       // Verify ownership
@@ -201,7 +200,7 @@ export async function bookingRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { tripId, bookingId } = request.params as { tripId: string; bookingId: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
       // Verify trip ownership
@@ -271,7 +270,7 @@ export async function bookingRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { tripId } = request.params as { tripId: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
       // Verify trip ownership

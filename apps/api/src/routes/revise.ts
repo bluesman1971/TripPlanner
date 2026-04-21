@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
 import { AnthropicProvider } from '../ai/anthropic.provider';
 import { MODEL_CONFIG } from '../config/models';
-import { getSupabase } from '../lib/supabase';
+import { getDB, getTripForConsultant } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
@@ -18,24 +18,6 @@ function writeSSE(raw: NodeJS.WritableStream, event: Record<string, unknown>) {
   raw.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-/** Returns the trip row if it belongs to the consultant, null otherwise. */
-async function getTripForConsultant(
-  tripId: string,
-  consultantId: string,
-  supabase: ReturnType<typeof getSupabase>,
-) {
-  const { data } = await supabase
-    .from('trips')
-    .select(`
-      id, destination, destination_country, status,
-      clients!inner(consultant_id)
-    `)
-    .eq('id', tripId)
-    .eq('clients.consultant_id', consultantId)
-    .single();
-  return data;
-}
-
 const ALLOWED_STATUSES = ['draft', 'review', 'complete'];
 
 export async function revisionRoutes(app: FastifyInstance) {
@@ -49,15 +31,15 @@ export async function revisionRoutes(app: FastifyInstance) {
   // Returns SSE: { type: 'chunk', text } | { type: 'done', versionNumber } | { type: 'ping' } | { type: 'error', message }
   app.post(
     '/trips/:id/revise/stream',
-    { preHandler: [requireAuth] },
+    { preHandler: [requireAuth], config: { rateLimit: { max: process.env.NODE_ENV === 'test' ? 1000 : 5, timeWindow: 60000 } } },
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { resumeFrom } = request.query as { resumeFrom?: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
-      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id);
       if (!trip) return reply.status(404).send({ error: 'Trip not found' });
 
       // ── Resume path: replay saved version from offset ────────────────────────

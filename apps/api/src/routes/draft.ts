@@ -2,12 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
 import { AnthropicProvider } from '../ai/anthropic.provider';
 import { MODEL_CONFIG } from '../config/models';
-import { getSupabase } from '../lib/supabase';
+import { getDB, getTripForConsultant } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
 import { DRAFT_SYSTEM_PROMPT, buildDraftUserMessage } from '../services/draftPrompt';
 import { fitToTokenBudget, CONTEXT_BUDGETS } from '../services/contextManager';
+import { sendDraftReadyEmail } from '../services/email';
 
 const provider = new AnthropicProvider();
 
@@ -18,25 +19,8 @@ function writeSSE(raw: NodeJS.WritableStream, event: Record<string, unknown>) {
   raw.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-/** Returns the trip row if it belongs to the consultant, null otherwise. */
-async function getTripForConsultant(
-  tripId: string,
-  consultantId: string,
-  supabase: ReturnType<typeof getSupabase>,
-) {
-  const { data } = await supabase
-    .from('trips')
-    .select(`
-      id, destination, destination_country, departure_city,
-      start_date, end_date, duration_days,
-      purpose, purpose_notes, status,
-      clients!inner(consultant_id)
-    `)
-    .eq('id', tripId)
-    .eq('clients.consultant_id', consultantId)
-    .single();
-  return data;
-}
+const DRAFT_TRIP_SELECT =
+  'id, destination, destination_country, departure_city, start_date, end_date, duration_days, purpose, purpose_notes, status, clients!inner(consultant_id)';
 
 export async function draftRoutes(app: FastifyInstance) {
 
@@ -48,15 +32,15 @@ export async function draftRoutes(app: FastifyInstance) {
   // Returns SSE: { type: 'chunk', text } | { type: 'done', versionNumber } | { type: 'ping' } | { type: 'error', message }
   app.post(
     '/trips/:id/draft/stream',
-    { preHandler: [requireAuth] },
+    { preHandler: [requireAuth], config: { rateLimit: { max: process.env.NODE_ENV === 'test' ? 1000 : 5, timeWindow: 60000 } } },
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { resumeFrom } = request.query as { resumeFrom?: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
-      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id, DRAFT_TRIP_SELECT);
       if (!trip) {
         return reply.status(404).send({ error: 'Trip not found' });
       }
@@ -229,6 +213,13 @@ export async function draftRoutes(app: FastifyInstance) {
           .update({ status: 'draft', updated_at: new Date().toISOString() })
           .eq('id', tripId);
 
+        // Fire-and-forget — email failure must never disrupt the SSE stream
+        sendDraftReadyEmail(
+          consultant,
+          { id: tripId, destination: trip.destination as string },
+          nextVersionNumber,
+        );
+
         writeSSE(reply.raw, { type: 'done', versionNumber: nextVersionNumber });
 
       } catch (err) {
@@ -249,10 +240,10 @@ export async function draftRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
-      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id);
       if (!trip) {
         return reply.status(404).send({ error: 'Trip not found' });
       }

@@ -1,29 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
-import { getSupabase } from '../lib/supabase';
+import { getDB, getTripForConsultant } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
-import { generateDocx } from '../services/docxGenerator';
-import { uploadDocxToR2, downloadR2AsBuffer } from '../lib/r2';
-
-/** Returns the trip row if it belongs to the consultant, null otherwise. */
-async function getTripForConsultant(
-  tripId: string,
-  consultantId: string,
-  supabase: ReturnType<typeof getSupabase>,
-) {
-  const { data } = await supabase
-    .from('trips')
-    .select(`
-      id, destination, destination_country, status,
-      clients!inner(consultant_id)
-    `)
-    .eq('id', tripId)
-    .eq('clients.consultant_id', consultantId)
-    .single();
-  return data;
-}
+import { downloadR2AsBuffer } from '../lib/r2';
+import { getDocumentQueue, type DocumentJobResult } from '../queues/document.queue';
 
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const ALLOWED_STATUSES = ['draft', 'review', 'complete'];
@@ -31,19 +13,19 @@ const ALLOWED_STATUSES = ['draft', 'review', 'complete'];
 export async function documentRoutes(app: FastifyInstance) {
 
   // POST /trips/:id/document
-  // Generates a DOCX from the latest itinerary version and uploads it to R2.
+  // Enqueues a DOCX generation job. Returns 202 + { jobId }.
   // Gate: trip status must be draft, review, or complete.
-  // Returns: { versionNumber, downloadPath }
+  // Poll GET /trips/:id/document/job/:jobId for completion.
   app.post(
     '/trips/:id/document',
     { preHandler: [requireAuth] },
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
-      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id);
       if (!trip) return reply.status(404).send({ error: 'Trip not found' });
 
       if (!ALLOWED_STATUSES.includes(trip.status as string)) {
@@ -52,7 +34,7 @@ export async function documentRoutes(app: FastifyInstance) {
         });
       }
 
-      // Fetch latest itinerary version
+      // Fetch the latest itinerary version — gate requires one to exist
       const { data: version } = await supabase
         .from('itinerary_versions')
         .select('id, version_number, markdown_content')
@@ -68,33 +50,67 @@ export async function documentRoutes(app: FastifyInstance) {
       }
 
       try {
-        const docxBuffer = await generateDocx(version.markdown_content, {
+        const queue = getDocumentQueue();
+        const job = await queue.add('generate', {
+          tripId,
+          consultantId: consultant.id,
+          versionId: version.id as string,
+          markdownContent: version.markdown_content as string,
           destination: trip.destination as string,
           mapsApiKey: process.env.GOOGLE_MAPS_API_KEY,
         });
 
-        const r2Key = await uploadDocxToR2(docxBuffer, tripId);
-
-        // Attach the R2 key to the itinerary version
-        await supabase
-          .from('itinerary_versions')
-          .update({ docx_r2_key: r2Key })
-          .eq('id', version.id);
-
-        // Advance trip status to 'review'
-        await supabase
-          .from('trips')
-          .update({ status: 'review', updated_at: new Date().toISOString() })
-          .eq('id', tripId);
-
-        return reply.status(200).send({
-          versionNumber: version.version_number,
-          downloadPath: `/trips/${tripId}/document/download`,
-        });
+        return reply.status(202).send({ jobId: job.id });
 
       } catch (err) {
         app.log.error(safeError(err));
         return reply.status(500).send({ error: 'Document generation failed. Please try again.' });
+      }
+    },
+  );
+
+  // GET /trips/:id/document/job/:jobId
+  // Polls BullMQ for the status of a document generation job.
+  // Returns: { status: 'waiting'|'active'|'completed'|'failed', result?, error? }
+  app.get(
+    '/trips/:id/document/job/:jobId',
+    { preHandler: [requireAuth] },
+    async (request, reply) => {
+      const { id: tripId, jobId } = request.params as { id: string; jobId: string };
+      const { userId } = getAuth(request);
+      const supabase = getDB();
+      const consultant = await getOrCreateConsultant(userId!, supabase);
+
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id);
+      if (!trip) return reply.status(404).send({ error: 'Trip not found' });
+
+      try {
+        const queue = getDocumentQueue();
+        const job = await queue.getJob(jobId);
+
+        if (!job) {
+          return reply.status(404).send({ error: 'Job not found' });
+        }
+
+        const state = await job.getState();
+
+        if (state === 'completed') {
+          const result = job.returnvalue as DocumentJobResult;
+          return reply.send({ status: 'completed', result });
+        }
+
+        if (state === 'failed') {
+          return reply.send({
+            status: 'failed',
+            error: 'Document generation failed. Please try again.',
+          });
+        }
+
+        return reply.send({ status: state });
+
+      } catch (err) {
+        app.log.error(safeError(err));
+        return reply.status(500).send({ error: 'Could not retrieve job status.' });
       }
     },
   );
@@ -107,10 +123,10 @@ export async function documentRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
-      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id);
       if (!trip) return reply.status(404).send({ error: 'Trip not found' });
 
       const { data: version } = await supabase
@@ -141,10 +157,10 @@ export async function documentRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
-      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id);
       if (!trip) return reply.status(404).send({ error: 'Trip not found' });
 
       const { data: version } = await supabase

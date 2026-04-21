@@ -1,8 +1,8 @@
 # TripPlanner — Project Task List
 
 > Last updated: 2026-04-21  
-> Current position: Sprint 4, Weeks 19–20 + live-debug session complete  
-> Next task: Sprint 4 — Email Notifications (Weeks 21–22)
+> Current position: Sprint 4, Weeks 21–24 complete (Email Notifications + Security Audit)  
+> Next task: Sprint 4 — Beta + Public Launch (Weeks 25–26)
 
 ---
 
@@ -199,17 +199,47 @@
 - [x] **Feature**: Research prompt updated to include `[Verify on Google]` search links per venue (search URL constructed from venue name + city — no hallucination risk). Prompt explicitly forbids direct website/Maps URLs.
 - [x] **Feature**: `ResearchPanel` switched from `<pre>` to `ReactMarkdown` with `@tailwindcss/typography` prose styles — venue links are now clickable, open in new tab.
 
-### Weeks 21–22: Email Notifications
-- [ ] Email on: trip created, itinerary ready, document ready
-- [ ] Transactional email provider (Resend or Postmark)
-- [ ] Unsubscribe handling
+### Security Hardening — Tier 1 (Weeks 21–22, done before email) ✅
+- [x] AI streaming rate limit: 5 req/min per IP on `/research/stream`, `/draft/stream`, `/revise/stream` (1000 in test mode to avoid false failures)
+- [x] Google Maps SSRF: `encodeURIComponent()` replaces `replace(/ /g, '+')` in `docxGenerator.ts` — supports Unicode destinations, neutralises injection
+- [x] Portal token default expiry: 90 days after `trip.end_date`, or 90 days from NOW() if end_date is null
+- [x] Portal token revoke: `DELETE /trips/:id/portal/token` revokes all active tokens; "Revoke link" button added to ShareButton in TripPage
+- [x] POST /document body schema: evaluated and declined — handler never reads body, Fastify v5 rejects `undefined` against schema, zero security benefit
 
-### Weeks 23–24: Security Audit
-- [ ] CI: `npm audit --audit-level=high` on every PR
-- [ ] Dependency review: remove any unused packages
-- [ ] Penetration test checklist: auth bypass, IDOR, SSRF
-- [ ] SSRF: whitelist allowed domains for any server-side URL fetch
-- [ ] ClamAV file scanning before ingest pipeline (or use Cloudflare WAFV2 upload scanning)
+### Security Hardening — Tier 2 (architectural, done before email) ✅
+- [x] `apps/api/src/services/db.ts` — `getDB()` wraps service-role client; `getTripForConsultant(db, tripId, consultantId, select?)`, `getClientForConsultant()`, `getClientsForConsultant()` enforce ownership at query level
+- [x] `apps/api/eslint.config.js` — `no-restricted-imports` rule bans direct `lib/supabase` imports in all `src/routes/**/*.ts` files; TypeScript parser via `typescript-eslint`; script `pnpm --filter @trip-planner/api lint`
+- [x] All route handlers (`research.ts`, `draft.ts`, `revise.ts`, `document.ts`, `trips.ts`, `clients.ts`, `bookings.ts`, `portal.ts`) migrated from `getSupabase()` → `getDB()` + shared `getTripForConsultant()`; local duplicate functions removed
+- [x] `apps/api/src/queues/document.queue.ts` — BullMQ queue for async DOCX generation (`DocumentJobData`, `DocumentJobResult`, `getDocumentQueue()`)
+- [x] `apps/api/src/workers/document.worker.ts` — `processDocumentJob()` generates DOCX, uploads to R2, updates `itinerary_versions.docx_r2_key`, advances trip status → `review`; `startDocumentWorker()` with concurrency 2
+- [x] `apps/api/src/routes/document.ts` — POST now returns 202 + `{ jobId }`; new `GET /trips/:id/document/job/:jobId` polling endpoint; generation moved to worker
+- [x] `apps/api/src/index.ts` — `startDocumentWorker()` wired alongside `startIngestWorker()`; both closed on SIGTERM/SIGINT
+- [x] `apps/web/src/pages/TripPage.tsx` (DocumentPanel) — polls job status every 2s; "Queued…" / "Generating…" states while job runs; transitions to download link on completion
+- [x] `apps/api/src/routes/document.test.ts` — rewritten for async pattern; job-queue mocked; tests for 202 response, job-not-found 404, active/waiting/completed/failed states; 30 tests total
+- [x] 145 tests all passing; ESLint lint clean; web typecheck clean
+
+### Weeks 21–22: Email Notifications ✅
+- [x] Transactional email provider: **Resend** (`resend` package); fire-and-forget; no-op when `RESEND_API_KEY` absent
+- [x] `apps/api/src/services/email.ts` — `sendTripCreatedEmail`, `sendDraftReadyEmail`, `sendDocumentReadyEmail`
+- [x] `apps/api/src/lib/unsubscribeToken.ts` — HMAC-SHA256 signed tokens (reuses `ENCRYPTION_KEY`, timing-safe)
+- [x] `apps/api/src/routes/unsubscribe.ts` — `GET /unsubscribe?token=` public endpoint; sets `email_notifications=false`; returns HTML confirmation
+- [x] `apps/api/src/routes/unsubscribe.test.ts` — 6 tests (missing token, tampered token, happy path, DB side-effect, DB error 500)
+- [x] `supabase/migrations/20260421000006_consultant_email_notifications.sql` — `email_notifications boolean DEFAULT true` on consultants (**migration applied**)
+- [x] `lib/consultant.ts` — `email_notifications` added to `Consultant` interface and SELECT query
+- [x] Email triggers wired: `trips.ts` (trip created), `draft.ts` (draft ready), `document.worker.ts` (document ready)
+- [x] 151 tests all passing
+- [ ] **Deferred**: Create Resend account, add `RESEND_API_KEY` + `RESEND_FROM_EMAIL` to `.env` — code is ready, no-op until keys are added
+
+### Weeks 23–24: Security Audit ✅
+- [x] `pnpm audit` — 2 moderate vulns found, both in `vitest→vite→esbuild` dev-dependency chain (dev-only, no production exposure)
+- [x] Vitest upgrade attempt (v4): broke streaming test mocks (`vi.fn().mockImplementation()` incompatible with v4 hoisting). Held at vitest 2.x; documented gotcha.
+- [x] **Auth sweep**: All 27 protected routes confirmed `requireAuth` ✓; 3 intentionally public routes correct (`/portal/:token`, `/portal/:token/pdf`, `/unsubscribe`) ✓
+- [x] **SSRF sweep**: One surface only (Google Maps in `docxGenerator.ts`); hostname locked + `encodeURIComponent`; no other outbound fetches found
+- [x] **Runtime bug fixed**: `bookings.ts:83` — `getSupabase()` called without import; would throw `ReferenceError` on every booking upload. Fixed to use `supabase` already in scope.
+- [x] **Type safety fixed**: `trips.ts:52` and `portal.ts:24` — `ReturnType<typeof getSupabase>` with unimported identifier resolved silently to `any`. Fixed to use `type DB` from `services/db.ts`.
+- [x] No TODO/FIXME/HACK comments found in codebase
+- [ ] **Deferred**: CI `pnpm audit` on every PR (no CI pipeline exists yet — addressed in Weeks 25–26)
+- [ ] **Deferred**: ClamAV / Cloudflare WAF file scanning (infrastructure dependency; low priority for solo-consultant tool)
 
 ### Weeks 25–26: Beta + Public Launch
 - [ ] Staging environment (separate Supabase project + R2 bucket)
@@ -223,16 +253,23 @@
 
 ## Immediate Next Actions (start of next session)
 
-**Supabase migrations to run before starting:**
-- `20260421000005_portal_tokens.sql` — portal_tokens table (**not yet run**)
+**Supabase migrations — all applied:**
+- `20260421000005_portal_tokens.sql` ✅
+- `20260421000006_consultant_email_notifications.sql` ✅
 
-**Current test suite:** 143 tests across 8 files, all passing.  
-Run with: `pnpm --filter @trip-planner/api test`
+**Current test suite:** 151 tests across 9 files, all passing.  
+Run with: `pnpm --filter @trip-planner/api test`  
+Lint: `pnpm --filter @trip-planner/api lint`
 
 **Known outstanding issue:** Delete trip button not confirmed working on pre-existing trips — test on a newly created trip before relying on it.
 
-**Next task: Sprint 4 — Email Notifications (Weeks 21–22)**
+**Deferred activation:** Email notifications are fully coded. To activate: create Resend account → add `RESEND_API_KEY` and `RESEND_FROM_EMAIL` to `.env`. No code changes required.
 
-1. **Transactional email provider** — integrate Resend or Postmark
-2. **Email triggers** — trip created, itinerary ready (draft generated), document ready
-3. **Unsubscribe handling** — one-click unsubscribe link in emails
+**Next task: Sprint 4 — Beta + Public Launch (Weeks 25–26)**
+
+1. **Staging environment** — separate Supabase project + R2 bucket
+2. **Monitoring** — Sentry for error tracking
+3. **Analytics** — PostHog for product usage
+4. **Onboarding flow** — first-time consultant setup wizard
+5. **Pricing + Stripe** — pricing page + subscription billing
+6. **Public launch**

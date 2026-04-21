@@ -12,6 +12,7 @@ import { draftRoutes } from './routes/draft';
 import { documentRoutes } from './routes/document';
 import { revisionRoutes } from './routes/revise';
 import { portalRoutes } from './routes/portal';
+import { unsubscribeRoutes } from './routes/unsubscribe';
 import { safeReqSerializer } from './lib/logger';
 
 export async function buildApp() {
@@ -66,6 +67,8 @@ export async function buildApp() {
   await app.register(revisionRoutes);
   // Portal routes have both Clerk-protected (token create) and public (token view/pdf) endpoints
   await app.register(portalRoutes);
+  // Public — no Clerk auth; HMAC-signed token identifies the consultant
+  await app.register(unsubscribeRoutes);
 
   // Health check (no auth required)
   app.get('/health', async () => ({ status: 'ok' }));

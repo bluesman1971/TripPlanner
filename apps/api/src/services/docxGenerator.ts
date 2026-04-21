@@ -31,8 +31,7 @@ export async function fetchMapImage(
   const markerParams = addresses
     .slice(0, 5)
     .map((addr, i) => {
-      // Replace spaces with + per Google Maps Static API spec
-      const location = `${addr}, ${destination}`.replace(/ /g, '+');
+      const location = encodeURIComponent(`${addr}, ${destination}`);
       return `markers=color:0x1B4F72|label:${i + 1}|${location}`;
     })
     .join('&');

@@ -10,6 +10,7 @@ export interface Consultant {
   name: string;
   email: string;
   auth_user_id: string;
+  email_notifications: boolean;
 }
 
 /**
@@ -22,7 +23,7 @@ export async function getOrCreateConsultant(
 ): Promise<Consultant> {
   const { data: existing } = await supabase
     .from('consultants')
-    .select('id, name, email, auth_user_id')
+    .select('id, name, email, auth_user_id, email_notifications')
     .eq('auth_user_id', userId)
     .single();
 
@@ -37,7 +38,7 @@ export async function getOrCreateConsultant(
   const { data: created, error } = await supabase
     .from('consultants')
     .insert({ auth_user_id: userId, name, email })
-    .select('id, name, email, auth_user_id')
+    .select('id, name, email, auth_user_id, email_notifications')
     .single();
 
   if (error || !created) {

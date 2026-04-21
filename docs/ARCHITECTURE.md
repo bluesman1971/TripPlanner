@@ -1,7 +1,7 @@
 # TripPlanner — Architecture Reference
 
 > Last updated: 2026-04-21  
-> Build status: Sprint 4, Weeks 19–20 complete (Client Portal + Booking Management + Live Debug session done)  
+> Build status: Sprint 4, Weeks 21–24 complete (Email Notifications + Security Audit)  
 > Prototype validated on Barcelona trip (April 19 2026)
 
 ---
@@ -326,16 +326,18 @@ GET  /trips/:id/draft        → ItineraryVersion | null
 SSE events: `{ type: 'chunk', text }` | `{ type: 'done', versionNumber }` | `{ type: 'error', message }`  
 Gate: status must be `research`. Model tier: **quality** (claude-opus-4-6), maxTokens: 12 000. Saves to `itinerary_versions` with auto-incrementing version_number. Never overwrites. Advances status → `draft`.
 
-### Document (Phase 6) — Week 15
+### Document (Phase 6) — Week 15 (async rewrite: Tier 2)
 ```
-POST /trips/:id/document          → { versionNumber, downloadPath }
-GET  /trips/:id/document          → { versionNumber, createdAt, downloadPath } | null
-GET  /trips/:id/document/download → DOCX binary (attachment)
+POST /trips/:id/document              → { jobId } (202)
+GET  /trips/:id/document/job/:jobId   → { status, result?, error? }
+GET  /trips/:id/document              → { versionNumber, createdAt, downloadPath } | null
+GET  /trips/:id/document/download     → DOCX binary (attachment)
 ```
 
 POST gate: status must be `draft`, `review`, or `complete` (re-generation is allowed).  
-Generates DOCX from latest `itinerary_versions.markdown_content` via `docxGenerator.ts`.  
-Uploads to R2 at `itineraries/{tripId}/{uuid}.docx`. Saves `docx_r2_key` on the version row. Advances status → `review`.  
+POST enqueues a BullMQ job on the `document-generation` queue and returns `{ jobId }` immediately (202).  
+Poll `GET /document/job/:jobId` for `{ status: 'waiting'|'active'|'completed'|'failed', result?, error? }`.  
+Worker (`document.worker.ts`) generates DOCX via `docxGenerator.ts`, uploads to R2, saves `docx_r2_key` on the version row, and advances trip status → `review`.  
 Download endpoint is an authenticated proxy — no presigned URLs, requires Clerk JWT.  
 Google Maps day maps require `GOOGLE_MAPS_API_KEY` in `.env`; silently skipped if absent.
 
@@ -376,6 +378,30 @@ No API or DB changes. Two updates only:
 
 **`TripPage.tsx` ResearchPanel**: Switched from `<pre>` plain-text rendering to `ReactMarkdown` with `@tailwindcss/typography` prose styles. External links open in a new tab (`target="_blank" rel="noopener noreferrer"`). Applies to both the idle (saved note) view and the streaming view. Required installing `@tailwindcss/typography` and adding `@plugin "@tailwindcss/typography"` to `index.css`.
 
+### Email Notifications — Weeks 21–22
+```
+GET /unsubscribe?token=...  → HTML confirmation page  (public — HMAC token auth)
+```
+
+Transactional email via **Resend** (`resend` npm package). Fires on three events:
+- **Trip created** (`POST /trips`) — consultant notified after successful insert
+- **Draft ready** (`POST /trips/:id/draft/stream`) — after version saved to `itinerary_versions`
+- **Document ready** (`document.worker.ts`) — after DOCX uploaded and `docx_r2_key` saved
+
+All sends are **fire-and-forget** — email failure never propagates to the HTTP caller or disrupts the SSE stream. If `RESEND_API_KEY` is absent (dev/test), every send is a silent no-op.
+
+**Unsubscribe**: HMAC-SHA256 signed token (reuses `ENCRYPTION_KEY`, timing-safe comparison). Token format: `base64url(consultantId).<hmac-hex>`. No DB storage required. `GET /unsubscribe?token=` verifies the token and sets `consultants.email_notifications = false`.
+
+**New env vars:**
+```
+RESEND_API_KEY=re_...
+RESEND_FROM_EMAIL=TripPlanner <notifications@yourdomain.com>
+APP_URL=https://yourapp.com   # optional; falls back to CORS_ORIGIN
+```
+
+**New files:** `lib/unsubscribeToken.ts`, `services/email.ts`, `routes/unsubscribe.ts`  
+**Migration:** `20260421000006_consultant_email_notifications.sql` — adds `email_notifications boolean DEFAULT true` to `consultants`
+
 ### Revision (Phase 7) — Week 16
 ```
 POST /trips/:id/revise/stream → SSE stream (text/event-stream)
@@ -406,13 +432,22 @@ DOCX files are served via the authenticated download proxy (`GET /trips/:id/docu
 
 ## 8. Job Queue (BullMQ + Upstash Redis)
 
-Queue name: `ingest`  
-Worker: `apps/api/src/workers/ingest.worker.ts`  
-Started in `index.ts` alongside the HTTP server.
+Two queues, both started in `index.ts` alongside the HTTP server.
+
+### `ingest` queue
+Worker: `apps/api/src/workers/ingest.worker.ts`
 
 Job flow:
 1. POST /bookings/upload → upload file to R2 → insert `documents` row → enqueue job → return `{ jobId }`
 2. Worker picks up job → downloads R2 file to temp → extracts text (pdf-parse / mammoth / plain-text) → calls AnthropicProvider (`fast` tier) → encrypts `raw_text` and `allergy_flags` → upserts `bookings` row → deletes temp file
+
+### `document-generation` queue
+Worker: `apps/api/src/workers/document.worker.ts` — concurrency: 2
+
+Job flow:
+1. POST /trips/:id/document → verify ownership + gate → fetch latest itinerary version → enqueue job → return `{ jobId }` (202)
+2. Worker picks up job → calls `generateDocx(markdown)` → uploads DOCX to R2 → updates `itinerary_versions.docx_r2_key` → advances trip status → `review`
+3. Frontend polls GET /trips/:id/document/job/:jobId every 2s; on `completed` transitions from "Generating…" to download link
 
 BullMQ requires `maxRetriesPerRequest: null` and `enableReadyCheck: false` for Upstash compatibility.
 
@@ -469,9 +504,9 @@ export const MODEL_CONFIG = {
 1. **No PII in logs.** `safeError()` in logger.ts strips full Supabase error objects. `redact()` removes known PII keys.
 2. **No API keys in frontend.** Anthropic key, DB credentials, R2 credentials → backend only.
 3. **Encrypted at rest.** `trip_brief` JSONB may contain allergy/medical data. `bookings.raw_text` and `bookings.allergy_flags` are encrypted before insert.
-4. **RLS on all tables.** Backend enforces additionally via explicit `consultant_id` filters.
+4. **RLS on all tables.** Backend enforces additionally via `services/db.ts` scoped helpers. `getDB()` returns the service-role client; `getTripForConsultant(db, tripId, consultantId)` always filters by `clients.consultant_id`. Direct `lib/supabase` imports are banned in route handlers via ESLint `no-restricted-imports` (`apps/api/eslint.config.js`).
 5. **File upload whitelist.** `.pdf .docx .doc .html .htm .txt .md .jpg .jpeg .png .webp`, max 20 MB.
-6. **Helmet + rate limiting.** `@fastify/helmet` security headers; `@fastify/rate-limit` 120 req/min global.
+6. **Helmet + rate limiting.** `@fastify/helmet` security headers; `@fastify/rate-limit` 120 req/min global; AI streaming endpoints (`/research/stream`, `/draft/stream`, `/revise/stream`) capped at 5 req/min per IP.
 7. **No raw SQL.** Parameterized queries only via Supabase client.
 
 ---
@@ -560,6 +595,17 @@ apps/web/src/
 | Fastify v5 empty JSON body | Fastify v5 rejects any request with `Content-Type: application/json` and an empty body (`FST_ERR_CTP_EMPTY_JSON_BODY`). `apiFetch` and `apiStream` in `api.ts` must NOT set `Content-Type: application/json` on bodyless POSTs. Fixed: header is now conditional on `options.body` being present. Affected: research/stream, portal/token, document generation. |
 | `meeting_point` vs `meeting_point_address` | The `bookings` table has `meeting_point_address` only — there is no separate `meeting_point` column. The manual booking insert previously included `meeting_point` which caused a Supabase schema cache error. Removed. |
 | Venue URL hallucination | Do NOT ask Claude to produce direct website or Google Maps place URLs — it will hallucinate plausible-looking but incorrect links. Instead, instruct it to construct Google search URLs from venue name + city (`https://www.google.com/search?q=Venue+Name+City`). These are always correct because Claude builds them from text it already wrote. |
+| Google Maps address encoding | `fetchMapImage` in `docxGenerator.ts` uses `encodeURIComponent(addr + ', ' + destination)` for the marker location — NOT `replace(/ /g, '+')`. URI encoding handles Unicode addresses (Zürich, Málaga, etc.) and neutralises newline/header injection. The hostname check (`ALLOWED_MAP_HOST`) remains as belt-and-suspenders. (Tier 1 security fix) |
+| Route handlers and lib/supabase | Route handlers must NOT import from `lib/supabase` directly. Use `getDB()` and the scoped helpers from `services/db.ts`. Enforced by ESLint `no-restricted-imports` in `eslint.config.js`. Workers and lib files are exempt — they legitimately call the service-role client without a user context. |
+| `ReturnType<typeof getSupabase>` in route files | Using `ReturnType<typeof getSupabase>` as a parameter type in route files where `getSupabase` is not imported resolves silently to `any` in TypeScript — no compiler error, but type safety is lost. Use `type DB` imported from `services/db.ts` instead. |
+| `getSupabase()` call without import (runtime bug) | `bookings.ts` upload handler previously called `getSupabase()` as a second client for the `documents` insert, but `getSupabase` was not imported. This caused a `ReferenceError` at runtime on every booking upload. Fixed: use the `supabase` variable already in scope from `getDB()`. Always use the client already obtained at the top of the handler. |
+| Vitest upgrade to v3+/v4 | Vitest 4 breaks all three streaming test files: `AnthropicProvider` is mocked with `vi.fn().mockImplementation()` but Vitest 4 hoisting changes cause the mock to be applied before `vi.fn()` resolves, resulting in `TypeError: is not a constructor`. Stay on Vitest 2.x until the mock pattern is updated to `vi.hoisted()`. The CVEs in the vitest→vite→esbuild chain are dev-only and do not affect production. |
+| Resend email — no-op without API key | `services/email.ts` checks for `RESEND_API_KEY` at send time and returns immediately if absent. This means emails silently do nothing in dev/test — correct behaviour, not a bug. Add the key to `.env` when ready to activate. |
+| Unsubscribe token uses ENCRYPTION_KEY | `lib/unsubscribeToken.ts` signs tokens with HMAC-SHA256 keyed on `ENCRYPTION_KEY`. Rotating `ENCRYPTION_KEY` invalidates all outstanding unsubscribe links. Use a dedicated `UNSUBSCRIBE_SECRET` env var if key rotation is required in future. |
+| Document generation timeout | Document generation (DOCX + Google Maps fetches) can take 8 s per map image × N days. Moved to BullMQ `document-generation` queue — POST returns 202 + jobId immediately; frontend polls GET /document/job/:jobId. Avoids reverse-proxy 30 s timeout. |
+| AI streaming rate limit | `/research/stream`, `/draft/stream`, `/revise/stream` are limited to 5 req/min per IP in production. In `NODE_ENV=test` the limit is set to 1000 to avoid flapping test counts. |
+| Portal token expiry | Tokens default to 90 days after `trip.end_date`; if `end_date` is null, 90 days from token creation time (`NOW()`). Never use `created_at + 90d` — the trip may have been created months before the token. |
+| POST /document body schema | Fastify v5 validates `undefined` against a JSON Schema body definition and rejects it. Since `POST /trips/:id/document` never reads `request.body`, adding a body schema provides zero security benefit and breaks inject-based tests. Recommendation to add one was evaluated and declined. |
 | @tailwindcss/typography | Required for `prose` classes used in ResearchPanel markdown rendering. Install with `pnpm add @tailwindcss/typography` in `apps/web`, then add `@plugin "@tailwindcss/typography";` to `apps/web/src/index.css`. Tailwind v4 plugin syntax — not the v3 `plugins: [require(...)]` approach. |
 | `isFirstUpload` gate | The `UploadSection` condition was `!trip.documents_ingested && trip.bookings.length === 0`. The `bookings.length` check blocked the `documentsIngested: true` PATCH when manual bookings existed, leaving `documents_ingested` permanently `false` and blocking research. Fixed to `!trip.documents_ingested` only. |
 
@@ -584,7 +630,8 @@ Critical values that must not drift:
 pnpm dev                              # starts api + web concurrently via Turborepo
 pnpm --filter @trip-planner/api dev   # API only (port 3000)
 pnpm --filter @trip-planner/web dev   # Web only (port 5174)
-pnpm --filter @trip-planner/api test  # Vitest (129 tests across 7 files — all passing)
+pnpm --filter @trip-planner/api test  # Vitest (151 tests across 9 files — all passing)
+pnpm --filter @trip-planner/api lint  # ESLint — enforces no direct lib/supabase imports in routes
 pnpm --filter @trip-planner/api typecheck
 pnpm --filter @trip-planner/web typecheck
 ```
@@ -594,6 +641,8 @@ pnpm --filter @trip-planner/web typecheck
 ```
 apps/api/src/
 ├── services/
+│   ├── db.ts               — getDB(), getTripForConsultant(), getClientForConsultant(), getClientsForConsultant()
+│   │                          All route handlers must import from here — never from lib/supabase directly
 │   ├── contextManager.ts   — fitToTokenBudget(), estimateTokens(); phase input budgets
 │   ├── contextManager.test.ts — 13 unit tests
 │   ├── researchPrompt.ts   — system prompt + user message builder for Phase 3
@@ -602,21 +651,28 @@ apps/api/src/
 │   ├── docxGenerator.ts    — markdown → DOCX (docx package); Google Maps day maps
 │   ├── bookingParser.ts    — AI-assisted booking extraction (fast tier)
 │   └── extractor.ts        — PDF/DOCX/HTML text extraction
+├── queues/
+│   ├── ingest.queue.ts         — BullMQ Queue for booking ingestion
+│   └── document.queue.ts       — BullMQ Queue for async DOCX generation
+├── workers/
+│   ├── ingest.worker.ts        — booking ingestion pipeline
+│   └── document.worker.ts      — DOCX generation + R2 upload (concurrency: 2)
 ├── routes/
 │   ├── research.ts + research.test.ts   — Phase 3 SSE stream + GET   (18 tests)
 │   ├── draft.ts    + draft.test.ts      — Phase 5 SSE stream + GET   (26 tests)
-│   ├── document.ts + document.test.ts   — Phase 6 POST/GET/download  (28 tests)
+│   ├── document.ts + document.test.ts   — Phase 6 POST/job/GET/download (30 tests)
 │   ├── revise.ts   + revise.test.ts     — Phase 7 SSE stream         (25 tests)
 │   ├── portal.ts   + portal.test.ts     — Client portal              (15 tests)
-│   ├── trips.ts    + trips.test.ts      — CRUD                        (4 tests)
+│   ├── trips.ts    + trips.test.ts      — CRUD                        (6 tests)
 │   ├── clients.ts
-│   └── bookings.ts
+│   ├── bookings.ts + bookings.test.ts  — Booking CRUD               (10 tests)
+│   └── unsubscribe.ts + unsubscribe.test.ts — Email opt-out          (6 tests)
 └── lib/
     ├── r2.ts          — uploadToR2, downloadFromR2ToTemp, deleteFromR2,
     │                    uploadDocxToR2, downloadR2AsBuffer
     ├── encryption.ts  — AES-256-GCM encrypt/decrypt
     ├── logger.ts      — safeError, safeReqSerializer, redact
-    ├── supabase.ts    — service-role client singleton
+    ├── supabase.ts    — service-role client singleton (use via services/db.ts in routes)
     ├── consultant.ts  — getOrCreateConsultant
     └── redis.ts       — Upstash-compatible ioredis client
 ```

@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
 import { AnthropicProvider } from '../ai/anthropic.provider';
 import { MODEL_CONFIG } from '../config/models';
-import { getSupabase } from '../lib/supabase';
+import { getDB } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
@@ -27,12 +27,12 @@ export async function researchRoutes(app: FastifyInstance) {
   // Returns SSE: { type: 'chunk', text } | { type: 'done' } | { type: 'ping' } | { type: 'error', message }
   app.post(
     '/trips/:id/research/stream',
-    { preHandler: [requireAuth] },
+    { preHandler: [requireAuth], config: { rateLimit: { max: process.env.NODE_ENV === 'test' ? 1000 : 5, timeWindow: 60000 } } },
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { resumeFrom } = request.query as { resumeFrom?: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
       // ── Ownership check ──────────────────────────────────────────────────────
@@ -204,7 +204,7 @@ export async function researchRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
       const { data: trip } = await supabase

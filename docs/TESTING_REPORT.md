@@ -1,8 +1,8 @@
 # TripPlanner — API Testing Report
 
-> Updated: Sprint 4 (Weeks 19–20, continued) | Prepared: 2026-04-21  
+> Updated: Sprint 4 (Weeks 21–24: Email Notifications + Security Audit) | Prepared: 2026-04-21  
 > Reviewed by: Claude Code (Anthropic) on behalf of Tom Baker  
-> Status: **143 tests, all passing**
+> Status: **151 tests, all passing**
 
 ---
 
@@ -21,15 +21,16 @@ Tests cover three new route modules, each representing an AI pipeline phase:
 |---|---|---|
 | `research.ts` | Phase 3 — Destination research | 18 |
 | `draft.ts` | Phase 5 — Itinerary draft | 26 |
-| `document.ts` | Phase 6 — Document generation | 28 |
+| `document.ts` | Phase 6 — Document generation (async) | 30 |
 | `revise.ts` | Phase 7 — Itinerary revision | 25 |
 | `portal.ts` | Client Portal — token + view + PDF | 15 |
 | `trips.ts` | Core CRUD + DELETE trip | 6 |
 | `bookings.ts` | Booking CRUD (delete, manual, list) | 10 |
+| `unsubscribe.ts` | Email opt-out endpoint | 6 |
 | `contextManager.ts` | Context budget utilities | 13 |
-| **Total** | | **143** |
+| **Total** | | **151** |
 
-> Route counts include new tests from Weeks 17–18 (usage logging, resume path), Weeks 19–20 (portal), and the continued Weeks 19–20 session (booking management). The contextManager unit tests are in `services/contextManager.test.ts`.
+> Route counts include new tests from Weeks 17–18 (usage logging, resume path), Weeks 19–20 (portal), the continued Weeks 19–20 session (booking management), Security Hardening Tier 2 (document async pattern + job status polling), and Weeks 21–22 (email unsubscribe). The contextManager unit tests are in `services/contextManager.test.ts`.
 
 ---
 
@@ -174,17 +175,28 @@ Each AI phase has a gate condition that must be satisfied before the phase can r
 | Returns `null` when none | Correct null response |
 | Returns draft content | `markdown_content` matches inserted row |
 
-### Document generation (POST /document)
+### Document generation (POST /document — async after Tier 2 rewrite)
 
 | Test | What it verifies |
 |---|---|
-| Calls `generateDocx` with markdown | Correct markdown content passed to generator |
-| Uploads buffer to R2 | `uploadDocxToR2` called once with correct `tripId` |
-| Saves `docx_r2_key` to version row | Correct version ID updated with R2 key |
-| Advances status to `review` | Status update issued |
-| Returns `versionNumber` + `downloadPath` | Response shape is correct |
+| Returns 202 + `{ jobId }` | Enqueues job immediately, does not block |
+| Enqueues job with correct payload | `tripId`, `markdownContent`, `destination` passed to queue |
 | Works at `review` status | Re-generation is allowed |
 | Works at `complete` status | Re-generation is allowed |
+
+### Job status polling (GET /document/job/:jobId)
+
+| Test | What it verifies |
+|---|---|
+| 401 unauthenticated | Auth required |
+| 404 IDOR | Trip owned by another consultant → 404 |
+| 404 job not found | Unknown jobId |
+| Returns `active` state | Passes through BullMQ state |
+| Returns `waiting` state | Passes through BullMQ state |
+| Returns `completed` with result | `{ status: 'completed', result: { versionNumber, downloadPath } }` |
+| Returns `failed` with generic message | Internal error not leaked |
+
+Note: DOCX generation, R2 upload, `docx_r2_key` save, and status advance are now tested in the worker (not the route). Route tests only verify the queue interaction.
 
 ### Document GET (GET /document)
 
@@ -309,26 +321,25 @@ Three failures were encountered and resolved during this sprint. All are documen
 
 ---
 
-### Google Maps SSRF surface
+### ~~Google Maps SSRF surface~~ RESOLVED
 
 **File:** `apps/api/src/services/docxGenerator.ts`, `fetchMapImage()`  
-**Design:** Addresses from the markdown are embedded into a Google Maps Static API URL. The hostname is locked to `maps.googleapis.com` in the code and verified with `new URL(rawUrl).hostname` before the `https.get()` call.  
-**Gap to verify:** Ensure the addresses themselves (extracted from `**Meeting point:**` lines in AI-generated markdown) cannot contain URL-injection sequences (e.g., `@`, newlines). The current implementation uses string concatenation + space→`+` substitution; it does not percent-encode the full address.  
-**Recommendation:** Add a strict address sanitiser that strips any character outside `[A-Za-z0-9 ,.-]` before embedding in the URL.
+**Original gap:** String concatenation + `replace(/ /g, '+')` did not percent-encode the full address; Unicode chars and injection sequences could escape.  
+**Resolution (Tier 1):** Changed to `encodeURIComponent(addr + ', ' + destination)`. Handles Unicode destinations (Zürich, Málaga) and neutralises newline/header injection. Hostname check (`ALLOWED_MAP_HOST`) retained as belt-and-suspenders.
 
 ---
 
-### No rate limiting on AI streaming endpoints
+### ~~No rate limiting on AI streaming endpoints~~ RESOLVED
 
-**Issue:** The global `@fastify/rate-limit` is set at 120 req/min per IP. The AI streaming endpoints (`/research/stream`, `/draft/stream`) each trigger a full Anthropic API call that can cost thousands of tokens. A single user could trigger 120 AI calls per minute before being rate-limited.  
-**Recommendation:** Add a tighter per-route rate limit on these three endpoints (e.g., 5 req/min per user).
+**Original gap:** Global 120 req/min limit allowed 120 AI calls per minute.  
+**Resolution (Tier 1):** Per-route rate limit of 5 req/min per IP on `/research/stream`, `/draft/stream`, `/revise/stream`. Set to 1000 in `NODE_ENV=test` to avoid test flapping. Uses Fastify per-route `config: { rateLimit: { max, timeWindow } }` syntax.
 
 ---
 
-### Document generation is synchronous
+### ~~Document generation is synchronous~~ RESOLVED
 
-**Issue:** `POST /trips/:id/document` runs DOCX generation + R2 upload synchronously in the request handler. For a long itinerary with Google Maps fetches (up to 8 seconds per image × N days), this could approach the 30-second timeout on many reverse proxies.  
-**Recommendation:** Either move to async job queue (BullMQ, consistent with the booking ingestion pattern) or add a request timeout with a clear error.
+**Original gap:** Synchronous DOCX + R2 upload in the request handler could hit reverse-proxy 30 s timeout.  
+**Resolution (Tier 2):** Moved to BullMQ `document-generation` queue. `POST /trips/:id/document` returns `202 + { jobId }` immediately. Worker (`document.worker.ts`, concurrency 2) runs the generation. Frontend polls `GET /trips/:id/document/job/:jobId` every 2 s. Consistent with booking ingestion pattern.
 
 ---
 
@@ -404,12 +415,14 @@ Three failures were encountered and resolved during this sprint. All are documen
 
 | File | Route | Tests |
 |---|---|---|
-| `apps/api/src/routes/trips.test.ts` | Trips CRUD | 4 |
+| `apps/api/src/routes/trips.test.ts` | Trips CRUD + DELETE | 6 |
 | `apps/api/src/routes/research.test.ts` | Research phase | 18 |
 | `apps/api/src/routes/draft.test.ts` | Draft phase | 26 |
-| `apps/api/src/routes/document.test.ts` | Document generation | 28 |
+| `apps/api/src/routes/document.test.ts` | Document generation (async) | 30 |
 | `apps/api/src/routes/revise.test.ts` | Revision phase | 25 |
 | `apps/api/src/routes/portal.test.ts` | Client portal | 15 |
+| `apps/api/src/routes/bookings.test.ts` | Booking CRUD | 10 |
+| `apps/api/src/routes/unsubscribe.test.ts` | Email opt-out | 6 |
 | `apps/api/src/services/contextManager.test.ts` | Context manager utilities | 13 |
 
 Run all: `pnpm --filter @trip-planner/api test`
@@ -489,19 +502,69 @@ No new automated tests added in this session (bugs were in frontend logic and pr
 
 ## 15. Summary
 
+---
+
+## 16. Weeks 21–22 New Tests (Email Unsubscribe)
+
+### Unsubscribe route tests (`unsubscribe.test.ts`, 6 tests — new file)
+
+| Test | What it verifies |
+|---|---|
+| `GET /unsubscribe` — 400 when token missing | Query param is required; error page returned (not JSON) |
+| `GET /unsubscribe` — 400 when token malformed | No dot separator → invalid |
+| `GET /unsubscribe` — 400 when signature tampered | Last 4 hex chars replaced; timing-safe comparison rejects |
+| `GET /unsubscribe` — 200 with HTML confirmation | Valid token → success page containing "unsubscribed" |
+| `GET /unsubscribe` — updates correct consultant in DB | `UPDATE consultants SET email_notifications=false WHERE id=consultantId` |
+| `GET /unsubscribe` — 500 on DB error; internal error not leaked | Generic HTML error page; "connection lost" not in response body |
+
+**Mock design:** Real `unsubscribeToken` module used (tests actual HMAC signing/verification with `ENCRYPTION_KEY='a'.repeat(64)` set in test env). Supabase mocked at `lib/supabase`. No auth mock needed — endpoint is fully public. `vi.clearAllMocks()` in `beforeEach`.
+
+**Token security:** Tests verify timing-safe comparison by tampering the last 4 hex chars of a valid signature and confirming rejection. The `timingSafeEqual` in `lib/unsubscribeToken.ts` prevents timing-based enumeration of valid consultant IDs.
+
+---
+
+## 17. Weeks 23–24 Security Audit Findings
+
+### Bugs found by automated sweep (not previously tested)
+
+| Bug | Severity | File | Fix |
+|---|---|---|---|
+| `getSupabase()` called without import | 🔴 Runtime | `bookings.ts:83` | Replaced with `supabase` already in scope; would have thrown `ReferenceError` on every booking file upload |
+| `ReturnType<typeof getSupabase>` type reference | 🟡 Type safety | `trips.ts:52`, `portal.ts:24` | Changed to `type DB` from `services/db.ts`; previous type resolved silently to `any` |
+
+### Vulnerability scan results
+
+| Package | CVE | Severity | Affected path | Remediation |
+|---|---|---|---|---|
+| esbuild ≤0.24.2 | GHSA-67mh-4wv8-2f99 | Moderate | `api > vitest > vite > esbuild` | Dev-only; upgrade blocked by vitest 4 mock breaking changes. Documented gotcha. |
+| vite ≤6.4.1 | GHSA-4w7w-66w2-5vf9 | Moderate | `api > vitest > vite` | Dev-only; same blocker. No production exposure. |
+
+Both vulnerabilities require access to the Vite dev server (which the API does not use — it uses `tsx`). Production risk: none.
+
+### Auth and SSRF sweep results
+
+All 27 Clerk-protected routes confirmed `requireAuth` present. 3 public routes (`/portal/:token`, `/portal/:token/pdf`, `/unsubscribe`) confirmed intentionally unprotected with alternative auth (token-based or HMAC). No unexpected public endpoints found.
+
+SSRF surface: one location (`docxGenerator.ts` `fetchMapImage`). Hostname locked to `maps.googleapis.com`. Address encoded with `encodeURIComponent`. No other outbound server-side HTTP found.
+
+---
+
+## 15. Summary
+
 | Category | Count | Pass |
 |---|---|---|
-| Auth (401) tests | 11 | ✅ 11/11 |
-| IDOR prevention tests | 16 | ✅ 16/16 |
-| Token validation tests (portal) | 3 | ✅ 3/3 |
+| Auth (401) tests | 13 | ✅ 13/13 |
+| IDOR prevention tests | 17 | ✅ 17/17 |
+| Token validation tests (portal + unsubscribe) | 6 | ✅ 6/6 |
 | Gate / precondition tests | 10 | ✅ 10/10 |
-| Happy-path functional tests | 33 | ✅ 33/33 |
+| Happy-path functional tests | 34 | ✅ 34/34 |
 | AI provider / PDF failure tests | 11 | ✅ 11/11 |
 | Usage logging tests | 3 | ✅ 3/3 |
 | Resume path tests | 3 | ✅ 3/3 |
 | Context manager unit tests | 13 | ✅ 13/13 |
-| Other (headers, content-type, versioning, side-effects, validation) | 40 | ✅ 40/40 |
-| **Total** | **143** | **✅ 143/143** |
+| Other (headers, content-type, versioning, side-effects, validation, job state, unsubscribe) | 41 | ✅ 41/41 |
+| **Total** | **151** | **✅ 151/151** |
 
-Failures during development: **6 total** — all resolved before merge. 3 from Weeks 13–16 (documented in section 8); 3 from Weeks 17–18 (mock call-count isolation). Weeks 19–20 (portal): zero failures on first run. Weeks 19–20 (booking management): zero failures on first run.  
+Failures during development: **6 total** — all resolved before merge. 3 from Weeks 13–16 (documented in section 8); 3 from Weeks 17–18 (mock call-count isolation). Weeks 19–20 (portal): zero failures on first run. Weeks 19–20 (booking management): zero failures on first run. Security Hardening Tiers 1 & 2: zero failures on first run. Weeks 21–22 (unsubscribe): zero failures on first run.  
+Runtime bugs found by security audit: **2** — `getSupabase()` without import in `bookings.ts` (section 17); `ReturnType<typeof getSupabase>` type hole in `trips.ts` and `portal.ts` (section 17). Both resolved.  
 Critical production bug found: **1** — `research_notes` column name mismatch (section 9, first item). Resolved.

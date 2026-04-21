@@ -2,11 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
 import { z } from 'zod';
 import { TripPurposeSchema, TripStatusSchema, DiscoverySchema, TravelerProfileSchema } from '@trip-planner/shared';
-import { getSupabase } from '../lib/supabase';
+import { getDB, type DB } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
 import { deleteFromR2 } from '../lib/r2';
+import { sendTripCreatedEmail } from '../services/email';
 
 // ─── Request schemas ──────────────────────────────────────────────────────────
 
@@ -48,7 +49,7 @@ const UpdateBriefSchema = z.object({
 async function getTripForConsultant(
   tripId: string,
   consultantId: string,
-  supabase: ReturnType<typeof getSupabase>,
+  supabase: DB,
 ) {
   const { data } = await supabase
     .from('trips')
@@ -72,7 +73,7 @@ export async function tripRoutes(app: FastifyInstance) {
   // GET /trips — list all trips for the logged-in consultant
   app.get('/trips', { preHandler: [requireAuth] }, async (request, reply) => {
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const { data, error } = await supabase
@@ -101,7 +102,7 @@ export async function tripRoutes(app: FastifyInstance) {
     }
 
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     // Verify the client belongs to this consultant
@@ -161,6 +162,9 @@ export async function tripRoutes(app: FastifyInstance) {
       .from('trip_brief')
       .insert({ trip_id: trip.id, brief_json: initialBrief, version: 1 });
 
+    // Fire-and-forget — email failure must never block the response
+    sendTripCreatedEmail(consultant, { id: trip.id as string, destination: trip.destination as string });
+
     return reply.status(201).send(trip);
   });
 
@@ -168,7 +172,7 @@ export async function tripRoutes(app: FastifyInstance) {
   app.get('/trips/:id', { preHandler: [requireAuth] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const trip = await getTripForConsultant(id, consultant.id, supabase);
@@ -216,7 +220,7 @@ export async function tripRoutes(app: FastifyInstance) {
     }
 
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const trip = await getTripForConsultant(id, consultant.id, supabase);
@@ -294,7 +298,7 @@ export async function tripRoutes(app: FastifyInstance) {
   app.delete('/trips/:id', { preHandler: [requireAuth] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const trip = await getTripForConsultant(id, consultant.id, supabase);

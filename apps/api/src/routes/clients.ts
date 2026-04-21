@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
 import { z } from 'zod';
-import { getSupabase } from '../lib/supabase';
+import { getDB } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
@@ -28,7 +28,7 @@ export async function clientRoutes(app: FastifyInstance) {
     }
 
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const { data, error } = await supabase
@@ -63,7 +63,7 @@ export async function clientRoutes(app: FastifyInstance) {
     }
 
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const updates: Record<string, string> = {};
@@ -94,7 +94,7 @@ export async function clientRoutes(app: FastifyInstance) {
   // GET /clients
   app.get('/clients', { preHandler: [requireAuth] }, async (request, reply) => {
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const { data, error } = await supabase
@@ -115,7 +115,7 @@ export async function clientRoutes(app: FastifyInstance) {
   app.get('/clients/:id', { preHandler: [requireAuth] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { userId } = getAuth(request);
-    const supabase = getSupabase();
+    const supabase = getDB();
     const consultant = await getOrCreateConsultant(userId!, supabase);
 
     const { data, error } = await supabase

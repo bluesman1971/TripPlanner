@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
-import { getSupabase } from '../lib/supabase';
+import { getDB, type DB } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
@@ -21,7 +21,7 @@ type PortalTokenRow = {
 
 async function resolveValidToken(
   token: string,
-  supabase: ReturnType<typeof getSupabase>,
+  supabase: DB,
 ): Promise<{ tokenRow: PortalTokenRow; tripId: string } | null> {
   const { data } = await supabase
     .from('portal_tokens')
@@ -49,13 +49,13 @@ export async function portalRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { id: tripId } = request.params as { id: string };
       const { userId } = getAuth(request);
-      const supabase = getSupabase();
+      const supabase = getDB();
       const consultant = await getOrCreateConsultant(userId!, supabase);
 
-      // Ownership check
+      // Ownership check — also fetch end_date to calculate default token expiry
       const { data: trip } = await supabase
         .from('trips')
-        .select('id, clients!inner(consultant_id)')
+        .select('id, end_date, clients!inner(consultant_id)')
         .eq('id', tripId)
         .eq('clients.consultant_id', consultant.id)
         .single();
@@ -66,9 +66,16 @@ export async function portalRoutes(app: FastifyInstance) {
 
       const token = crypto.randomBytes(32).toString('base64url');
 
+      // Default expiry: 90 days after trip end date, or 90 days from now if no end date.
+      const MS_90_DAYS = 90 * 24 * 60 * 60 * 1000;
+      const expiresAt = trip.end_date
+        ? new Date(new Date(trip.end_date as string).getTime() + MS_90_DAYS).toISOString()
+        : new Date(Date.now() + MS_90_DAYS).toISOString();
+
       await supabase.from('portal_tokens').insert({
         trip_id: tripId,
         token,
+        expires_at: expiresAt,
       });
 
       return reply.status(201).send({
@@ -85,7 +92,7 @@ export async function portalRoutes(app: FastifyInstance) {
     '/portal/:token',
     async (request, reply) => {
       const { token } = request.params as { token: string };
-      const supabase = getSupabase();
+      const supabase = getDB();
 
       const resolved = await resolveValidToken(token, supabase);
       if (!resolved) {
@@ -144,6 +151,40 @@ export async function portalRoutes(app: FastifyInstance) {
     },
   );
 
+  // DELETE /trips/:id/portal/token
+  // Consultant-only. Revokes all active portal tokens for the trip.
+  // Returns 204 on success.
+  app.delete(
+    '/trips/:id/portal/token',
+    { preHandler: [requireAuth] },
+    async (request, reply) => {
+      const { id: tripId } = request.params as { id: string };
+      const { userId } = getAuth(request);
+      const supabase = getDB();
+      const consultant = await getOrCreateConsultant(userId!, supabase);
+
+      // Ownership check
+      const { data: trip } = await supabase
+        .from('trips')
+        .select('id, clients!inner(consultant_id)')
+        .eq('id', tripId)
+        .eq('clients.consultant_id', consultant.id)
+        .single();
+
+      if (!trip) {
+        return reply.status(404).send({ error: 'Trip not found' });
+      }
+
+      await supabase
+        .from('portal_tokens')
+        .update({ revoked: true })
+        .eq('trip_id', tripId)
+        .eq('revoked', false);
+
+      return reply.status(204).send();
+    },
+  );
+
   // GET /portal/:token/pdf
   // Public — no Clerk JWT required.
   // Generates a PDF from the latest itinerary and streams it.
@@ -151,7 +192,7 @@ export async function portalRoutes(app: FastifyInstance) {
     '/portal/:token/pdf',
     async (request, reply) => {
       const { token } = request.params as { token: string };
-      const supabase = getSupabase();
+      const supabase = getDB();
 
       const resolved = await resolveValidToken(token, supabase);
       if (!resolved) {
