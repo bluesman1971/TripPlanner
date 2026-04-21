@@ -2,8 +2,8 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { useApi } from '../lib/api';
-import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { ErrorMessage } from '../components/ui/ErrorMessage';
+import { ClientListSkeleton } from '../components/ui/Skeleton';
 
 interface Client {
   id: string;
@@ -148,7 +148,7 @@ export function ClientsPage() {
         </button>
       </div>
 
-      {isLoading && <LoadingSpinner message="Loading clients…" />}
+      {isLoading && <ClientListSkeleton />}
       {error && <ErrorMessage message="Could not load clients. Make sure the API server is running." />}
 
       {!isLoading && !error && clients?.length === 0 && (

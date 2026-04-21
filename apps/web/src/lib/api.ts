@@ -84,5 +84,96 @@ export function useApi() {
     return response.json() as Promise<T>;
   }
 
-  return { apiFetch, apiUpload };
+  /**
+   * Initiates a streaming SSE fetch and calls onChunk for each text chunk.
+   * Returns when the stream ends or rejects on error.
+   */
+  async function apiStream(
+    path: string,
+    onChunk: (text: string) => void,
+    options: RequestInit = {},
+  ): Promise<void> {
+    const token = await getToken();
+
+    const response = await fetch(`${API_URL}${path}`, {
+      method: 'POST',
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...options.headers,
+      },
+    });
+
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const body = await response.json();
+        message = body.error ?? message;
+      } catch { /* ignore */ }
+      throw new ApiError(response.status, message);
+    }
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        try {
+          const event = JSON.parse(payload) as { type: string; text?: string; message?: string };
+          if (event.type === 'chunk' && event.text) {
+            onChunk(event.text);
+          } else if (event.type === 'error') {
+            throw new Error(event.message ?? 'Streaming error');
+          }
+          // type === 'done' — loop exits naturally when stream closes
+        } catch (e) {
+          if (e instanceof Error && e.message !== payload) throw e;
+        }
+      }
+    }
+  }
+
+  /**
+   * Downloads a binary file from the API (requires Clerk JWT).
+   * Triggers a browser download with the given filename.
+   */
+  async function apiDownload(path: string, filename: string): Promise<void> {
+    const token = await getToken();
+
+    const response = await fetch(`${API_URL}${path}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const body = await response.json();
+        message = body.error ?? message;
+      } catch { /* ignore */ }
+      throw new ApiError(response.status, message);
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  return { apiFetch, apiUpload, apiStream, apiDownload };
 }

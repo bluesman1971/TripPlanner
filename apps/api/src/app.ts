@@ -7,6 +7,10 @@ import { clerkPlugin } from '@clerk/fastify';
 import { clientRoutes } from './routes/clients';
 import { tripRoutes } from './routes/trips';
 import { bookingRoutes } from './routes/bookings';
+import { researchRoutes } from './routes/research';
+import { draftRoutes } from './routes/draft';
+import { documentRoutes } from './routes/document';
+import { revisionRoutes } from './routes/revise';
 import { safeReqSerializer } from './lib/logger';
 
 export async function buildApp() {
@@ -55,6 +59,10 @@ export async function buildApp() {
   await app.register(clientRoutes);
   await app.register(tripRoutes);
   await app.register(bookingRoutes);
+  await app.register(researchRoutes);
+  await app.register(draftRoutes);
+  await app.register(documentRoutes);
+  await app.register(revisionRoutes);
 
   // Health check (no auth required)
   app.get('/health', async () => ({ status: 'ok' }));

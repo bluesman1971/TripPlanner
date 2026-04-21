@@ -1,7 +1,7 @@
 # TripPlanner — Architecture Reference
 
-> Last updated: 2026-04-20  
-> Build status: Sprint 2, Week 9 complete  
+> Last updated: 2026-04-21  
+> Build status: Sprint 3, Weeks 17–18 complete (AI Integration sprint done)  
 > Prototype validated on Barcelona trip (April 19 2026)
 
 ---
@@ -88,6 +88,14 @@ CORS_ORIGIN=http://localhost:5174    # must match actual Vite dev port
 ```
 VITE_CLERK_PUBLISHABLE_KEY=pk_...
 VITE_API_URL=http://localhost:3000
+```
+
+### Optional env vars (feature-gated)
+
+```
+# Google Maps Static API — enables day map images in generated DOCX files.
+# Without this key, maps are silently skipped and generation still succeeds.
+GOOGLE_MAPS_API_KEY=AIza...
 ```
 
 **Critical:** `import 'dotenv/config'` must be the **first import** in `apps/api/src/index.ts`. tsx does not auto-load `.env`.
@@ -202,12 +210,16 @@ ingested_at           timestamptz
 
 **`itinerary_versions`**
 ```
-id              uuid PK
-trip_id         uuid FK → trips.id
-version_number  int
-docx_r2_key     text
-created_at      timestamptz
+id                    uuid PK
+trip_id               uuid FK → trips.id
+version_number        int
+markdown_content      text NOT NULL   ← AI-generated itinerary markdown
+generator_script_path text            ← nullable; reserved for future use
+docx_r2_key           text            ← nullable until document is generated
+created_at            timestamptz
+unique(trip_id, version_number)
 ```
+Note: ARCHITECTURE.md previously omitted `markdown_content`; the migration always had it.
 
 **`documents`**
 ```
@@ -220,13 +232,18 @@ size_bytes  int
 uploaded_at timestamptz
 ```
 
-**`research_notes`** — not yet wired to API; reserved for Phase 3
+**`research_notes`**
 ```
 id         uuid PK
 trip_id    uuid FK → trips.id
-content    text
+content    text NOT NULL   ← renamed from content_markdown by migration 000003
+model_used text
+input_tokens  int
+output_tokens int
 created_at timestamptz
 ```
+Note: initial schema named this column `content_markdown`; migration 000003 renames it
+to `content` to match application code.
 
 ### Migrations (run in order in Supabase SQL editor)
 
@@ -234,7 +251,9 @@ created_at timestamptz
 |---|---|---|
 | `20260420000000_initial_schema.sql` | All 8 tables + RLS | ✅ Run |
 | `20260420000001_encrypt_allergy_flags.sql` | Change allergy_flags to text for encrypted storage | ✅ Run |
-| `20260420000002_clients_contact_fields.sql` | Add phone, address_line, city, country, postal_code to clients | ⬅ **Run this next** |
+| `20260420000002_clients_contact_fields.sql` | Add phone, address_line, city, country, postal_code to clients | ✅ Run |
+| `20260420000003_research_notes_rename_column.sql` | Rename `content_markdown` → `content` in research_notes | ✅ Run |
+| `20260420000004_itinerary_versions_token_columns.sql` | Add input_tokens, output_tokens, model_used to itinerary_versions | ✅ Run |
 
 ---
 
@@ -277,13 +296,62 @@ GET  /trips/:tripId/bookings                → Booking[]
 
 Upload: multipart `file` field. Accepted types: `.pdf .docx .doc .html .htm .txt .md .jpg .jpeg .png .webp`. Max 20 MB.
 
+### Research (Phase 3) — Week 13
+```
+POST /trips/:id/research/stream → SSE stream (text/event-stream)
+GET  /trips/:id/research        → ResearchNote | null
+```
+
+SSE events: `{ type: 'chunk', text }` | `{ type: 'done' }` | `{ type: 'error', message }`  
+Gate: `documents_ingested = true`. Model tier: **balanced**. Saves to `research_notes`. Advances status → `research`.
+
+### Draft (Phase 5) — Week 14
+```
+POST /trips/:id/draft/stream → SSE stream (text/event-stream)
+GET  /trips/:id/draft        → ItineraryVersion | null
+```
+
+SSE events: `{ type: 'chunk', text }` | `{ type: 'done', versionNumber }` | `{ type: 'error', message }`  
+Gate: status must be `research`. Model tier: **quality** (claude-opus-4-6), maxTokens: 12 000. Saves to `itinerary_versions` with auto-incrementing version_number. Never overwrites. Advances status → `draft`.
+
+### Document (Phase 6) — Week 15
+```
+POST /trips/:id/document          → { versionNumber, downloadPath }
+GET  /trips/:id/document          → { versionNumber, createdAt, downloadPath } | null
+GET  /trips/:id/document/download → DOCX binary (attachment)
+```
+
+POST gate: status must be `draft`, `review`, or `complete` (re-generation is allowed).  
+Generates DOCX from latest `itinerary_versions.markdown_content` via `docxGenerator.ts`.  
+Uploads to R2 at `itineraries/{tripId}/{uuid}.docx`. Saves `docx_r2_key` on the version row. Advances status → `review`.  
+Download endpoint is an authenticated proxy — no presigned URLs, requires Clerk JWT.  
+Google Maps day maps require `GOOGLE_MAPS_API_KEY` in `.env`; silently skipped if absent.
+
+### Revision (Phase 7) — Week 16
+```
+POST /trips/:id/revise/stream → SSE stream (text/event-stream)
+```
+
+Body: `{ feedback: string }` — required, must be non-empty after trim.  
+SSE events: `{ type: 'chunk', text }` | `{ type: 'done', versionNumber }` | `{ type: 'error', message }`  
+Gate: status must be `draft`, `review`, or `complete`. No revision without an existing draft.  
+Model tier: **balanced** (claude-sonnet-4-6), maxTokens: 12 000.  
+Saves full revised markdown as `itinerary_versions` v[N+1] — never overwrites.  
+Advances status `draft` → `review` only; leaves `review` and `complete` unchanged.  
+There is no GET endpoint for revisions — `GET /trips/:id/draft` returns the latest version regardless of how it was created.
+
 ---
 
 ## 7. File Storage (Cloudflare R2)
 
-R2 key format: `bookings/{tripId}/{uuid}{ext}`  
-Original filename is never used in the R2 key.  
-Files are downloaded to a temp path for processing, then deleted from temp after ingestion.
+| Purpose | Key format |
+|---|---|
+| Booking uploads | `bookings/{tripId}/{uuid}{ext}` |
+| Generated DOCX | `itineraries/{tripId}/{uuid}.docx` |
+
+Original filename is never used in any R2 key.  
+Booking files are downloaded to a temp path for processing, then deleted from temp after ingestion.  
+DOCX files are served via the authenticated download proxy (`GET /trips/:id/document/download`) — never via presigned URL.
 
 ---
 
@@ -364,9 +432,9 @@ export const MODEL_CONFIG = {
 ```
 apps/web/src/
 ├── main.tsx            — ClerkProvider → QueryClientProvider → BrowserRouter → App
-├── App.tsx             — Route definitions
+├── App.tsx             — Route definitions (all pages wrapped in ErrorBoundary)
 ├── lib/
-│   ├── api.ts          — useApi() hook: attaches Clerk JWT to every fetch
+│   ├── api.ts          — useApi() hook: apiFetch, apiUpload, apiStream, apiDownload
 │   └── queryClient.ts  — TanStack Query client config
 ├── components/
 │   ├── layout/
@@ -374,13 +442,33 @@ apps/web/src/
 │   │   └── Sidebar.tsx   — Nav links (Dashboard, Clients, New Trip)
 │   └── ui/
 │       ├── LoadingSpinner.tsx
-│       └── ErrorMessage.tsx
+│       ├── ErrorMessage.tsx
+│       ├── ErrorBoundary.tsx  — React class boundary; wraps each route
+│       └── Skeleton.tsx       — TripListSkeleton, ClientListSkeleton, TripPageSkeleton
 └── pages/
     ├── SignInPage.tsx     — Clerk <SignIn> component
-    ├── DashboardPage.tsx  — Trip list with client filter
+    ├── DashboardPage.tsx  — Trip list; client filter via ?client= URL param
     ├── ClientsPage.tsx    — Client list, create/edit modal
-    └── NewTripPage.tsx    — 5-step trip creation wizard
+    ├── NewTripPage.tsx    — 5-step trip creation wizard
+    └── TripPage.tsx       — Trip workspace; contains:
+                              UploadSection        — file upload + job polling
+                              ResearchPanel        — stream/display research (Phase 3)
+                              DraftPanel           — stream/display draft (Phase 5)
+                              RevisionPanel        — feedback textarea + stream revision (Phase 7)
+                              DocumentPanel        — generate + download DOCX (Phase 6)
+                              VersionHistoryCard   — all versions newest-first; per-version .docx download
 ```
+
+### useApi() methods
+
+| Method | Purpose |
+|---|---|
+| `apiFetch<T>(path, options?)` | JSON fetch with Clerk JWT |
+| `apiUpload<T>(path, formData)` | Multipart upload with Clerk JWT |
+| `apiStream(path, onChunk, options?)` | SSE fetch; calls `onChunk` per text chunk |
+| `apiDownload(path, filename)` | Binary fetch → triggers browser download |
+
+`apiStream` uses `fetch()` + `ReadableStream.getReader()` (not `EventSource`) because `EventSource` cannot send custom headers (Clerk JWT required).
 
 ### Trip Wizard Steps (NewTripPage)
 1. **Client** — pick from existing clients (card picker)
@@ -404,6 +492,14 @@ apps/web/src/
 | Google Docs DOCX | Use `WidthType.DXA` not `WidthType.PERCENTAGE`; `ShadingType.CLEAR` not `ShadingType.SOLID` |
 | Itinerary versions | Never overwrite — always write v[N+1] |
 | Phase 3 gate | `documents_ingested: true` must be set before research phase can start |
+| SSE + Fastify | Set headers via `reply.raw.setHeader()` BEFORE `reply.hijack()`. Set CORS header manually on `reply.raw` — `@fastify/cors` doesn't fire after hijack |
+| EventSource auth | `EventSource` API cannot send `Authorization` headers. Use `fetch()` + `ReadableStream.getReader()` for all SSE endpoints |
+| research_notes column rename | Initial schema had `content_markdown`; migration 000003 renames it to `content`. Migration confirmed run. |
+| docx ImageRun | Pass `type: 'png'` explicitly; accessing `TextRun.root` is protected — filter empty runs before constructing `TextRun` objects |
+| StreamHandle + AnthropicProvider | Routes use `provider.streamWithUsage()` (concrete method, not on `AIProvider` interface) which returns a `StreamHandle`. Call `handle.getUsage()` AFTER iterating to completion — `finalMessage()` requires the stream to be exhausted |
+| Context budget heuristic | `estimateTokens` uses 4 chars/token. This is a rough estimate — actual token count varies by language and encoding. Good enough for budget gating; do not use for billing |
+| setInterval + hijacked SSE | The ping interval MUST be cleared in `finally { stopPing(); }` — if not cleared, it may fire after `reply.raw.end()` and write to a closed stream |
+| vi.clearAllMocks() | All test files that assert on mock call counts must call `vi.clearAllMocks()` at the top of `beforeEach`. Omitting it causes call counts to accumulate across tests |
 
 ---
 
@@ -426,7 +522,38 @@ Critical values that must not drift:
 pnpm dev                              # starts api + web concurrently via Turborepo
 pnpm --filter @trip-planner/api dev   # API only (port 3000)
 pnpm --filter @trip-planner/web dev   # Web only (port 5174)
-pnpm --filter @trip-planner/api test  # Vitest (4 tests)
+pnpm --filter @trip-planner/api test  # Vitest (114 tests across 6 files — all passing)
 pnpm --filter @trip-planner/api typecheck
 pnpm --filter @trip-planner/web typecheck
+```
+
+### API service files
+
+```
+apps/api/src/
+├── services/
+│   ├── contextManager.ts   — fitToTokenBudget(), estimateTokens(); phase input budgets
+│   ├── contextManager.test.ts — 13 unit tests
+│   ├── researchPrompt.ts   — system prompt + user message builder for Phase 3
+│   ├── draftPrompt.ts      — system prompt + user message builder for Phase 5
+│   ├── revisionPrompt.ts   — system prompt + user message builder for Phase 7
+│   ├── docxGenerator.ts    — markdown → DOCX (docx package); Google Maps day maps
+│   ├── bookingParser.ts    — AI-assisted booking extraction (fast tier)
+│   └── extractor.ts        — PDF/DOCX/HTML text extraction
+├── routes/
+│   ├── research.ts + research.test.ts   — Phase 3 SSE stream + GET   (18 tests)
+│   ├── draft.ts    + draft.test.ts      — Phase 5 SSE stream + GET   (26 tests)
+│   ├── document.ts + document.test.ts   — Phase 6 POST/GET/download  (28 tests)
+│   ├── revise.ts   + revise.test.ts     — Phase 7 SSE stream         (25 tests)
+│   ├── trips.ts    + trips.test.ts      — CRUD                        (4 tests)
+│   ├── clients.ts
+│   └── bookings.ts
+└── lib/
+    ├── r2.ts          — uploadToR2, downloadFromR2ToTemp, deleteFromR2,
+    │                    uploadDocxToR2, downloadR2AsBuffer
+    ├── encryption.ts  — AES-256-GCM encrypt/decrypt
+    ├── logger.ts      — safeError, safeReqSerializer, redact
+    ├── supabase.ts    — service-role client singleton
+    ├── consultant.ts  — getOrCreateConsultant
+    └── redis.ts       — Upstash-compatible ioredis client
 ```

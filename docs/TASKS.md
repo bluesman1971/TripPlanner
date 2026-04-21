@@ -1,8 +1,8 @@
 # TripPlanner — Project Task List
 
-> Last updated: 2026-04-20  
-> Current position: Sprint 2, Week 9 complete  
-> Next task: Week 10 — Trip workspace page
+> Last updated: 2026-04-21  
+> Current position: Sprint 3, Weeks 17–18 complete  
+> Next task: Sprint 4 — Client Portal (Weeks 19–20)
 
 ---
 
@@ -88,33 +88,34 @@
 
 ---
 
-### Week 10: Trip Workspace Page ⬅ START HERE
-- [ ] `apps/web/src/pages/TripPage.tsx` — GET /trips/:id
+### Week 10: Trip Workspace Page ✅
+- [x] `apps/web/src/pages/TripPage.tsx` — GET /trips/:id
   - Trip header: destination, dates, status badge (colour-coded by status)
   - Traveler profile summary card (group composition, pace, budget, interests)
-  - Brief panel: expandable JSON viewer or structured field display
+  - Discovery card (visit count, classic/bespoke ratio, must-sees, already-done)
   - Bookings list: table of ingested bookings (date, type, time, meeting point)
+  - Itinerary versions list (if any)
   - Empty state for each section
-- [ ] Wire route: `/trips/:id` in App.tsx
-- [ ] Link from DashboardPage trip rows → `/trips/:id`
-- [ ] Status badge colour map: setup=gray, ingestion=yellow, research=blue, draft=orange, review=purple, complete=green
+- [x] Wire route: `/trips/:id` in App.tsx
+- [x] Link from DashboardPage trip rows → `/trips/:id` (was already wired)
+- [x] Status badge colour map: setup=gray, ingestion=yellow, research=blue, draft=orange, review=purple, complete=green
 
-### Week 11: Document Upload UI
-- [ ] Upload button on TripPage (only shown when status = setup or ingestion)
-- [ ] File picker → POST /trips/:tripId/bookings/upload (multipart)
-- [ ] Job polling: GET /trips/:tripId/bookings/job/:jobId every 2s → show progress bar
-- [ ] On job complete: invalidate /trips/:id query → bookings list refreshes
-- [ ] Error state: show job error message if ingestion fails
-- [ ] After upload: PATCH /trips/:id/brief { documentsIngested: true, status: 'ingestion' } if first document
+### Week 11: Document Upload UI ✅
+- [x] Upload button on TripPage (only shown when status = setup or ingestion)
+- [x] File picker → POST /trips/:tripId/bookings/upload (multipart)
+- [x] Job polling: GET /trips/:tripId/bookings/job/:jobId every 2s → progress bar (indeterminate until worker starts, then 40/80/100%)
+- [x] On job complete: invalidate ['trip', id] query → bookings list refreshes
+- [x] Error state: show job error message with dismiss button
+- [x] After first upload: PATCH /trips/:id/brief { documentsIngested: true, status: 'ingestion' }
 
-### Week 12: Sprint 2 Polish
-- [ ] Dashboard: add client filter (URL param `?client=id` already read; hook up dropdown)
-- [ ] Dashboard: empty state with CTA to create first trip
-- [ ] Navigation: active link highlight in Sidebar
-- [ ] Error boundaries on each page
-- [ ] Loading skeleton components (replace spinner with content-shaped skeletons)
-- [ ] Responsive layout check (tablet minimum)
-- [ ] Run full typecheck + tests; fix any drift
+### Week 12: Sprint 2 Polish ✅
+- [x] Dashboard: client filter dropdown (reads/writes `?client=id` URL param; filters trip list)
+- [x] Dashboard: empty state with CTA to create first trip; separate message for filtered empty state
+- [x] Navigation: active link highlight in Sidebar (NavLink with isActive — was already correct)
+- [x] ErrorBoundary component wrapping each page route in App.tsx
+- [x] Skeleton components: TripListSkeleton, ClientListSkeleton, TripPageSkeleton (shimmer, content-shaped)
+- [x] Schema drift fixed: TripStatusSchema updated to match DB (review/complete, not revision/delivered); Discovery field names fixed in TripPage (destination_visits, ratio_classic_pct, must_sees, already_done)
+- [x] Full typecheck (web + api) and 4 tests — all passing
 
 ---
 
@@ -122,34 +123,47 @@
 
 > Sprint 3 detail will be fleshed out when Sprint 2 is done. High-level plan:
 
-### Week 13: Research Phase (Phase 3)
-- [ ] SSE streaming endpoint: POST /trips/:id/research/stream
-- [ ] AnthropicProvider `stream()` method wired to destination research prompt
-- [ ] Gate check: documents_ingested must be true before research can start
-- [ ] Research output saved to `research_notes` table
-- [ ] Web: "Start Research" button on TripPage (shown when status = ingestion and documents_ingested = true)
-- [ ] Web: streaming output display (live text as tokens arrive)
+### Week 13: Research Phase (Phase 3) ✅
+- [x] `apps/api/src/services/researchPrompt.ts` — system prompt + user message builder (mirrors Barcelona research.md structure)
+- [x] `POST /trips/:id/research/stream` — SSE endpoint (gate: documents_ingested required; streams balanced-tier response; saves to research_notes; advances status to 'research')
+- [x] `GET /trips/:id/research` — returns latest saved research note
+- [x] `apiStream()` added to useApi hook (fetch + ReadableStream, Clerk JWT, SSE parser)
+- [x] ResearchPanel on TripPage: "Start Research" button (ingestion + documents_ingested gate), live streaming with cursor, loads existing note if already generated
 
-### Week 14: Itinerary Draft (Phase 5)
-- [ ] POST /trips/:id/draft/stream — quality tier, full itinerary prompt
-- [ ] Dedup check logic (no venue appears twice without reason)
-- [ ] Draft saved to `itinerary_versions` (version 1)
-- [ ] Web: draft viewer on TripPage (markdown rendered)
+### Week 14: Itinerary Draft (Phase 5) ✅
+- [x] POST /trips/:id/draft/stream — quality tier, full itinerary prompt
+- [x] Dedup check logic in prompt (no venue appears twice without reason)
+- [x] Draft saved to `itinerary_versions` (version 1, increments on re-run)
+- [x] Web: DraftPanel on TripPage — "Generate draft" button, live streaming, loads existing draft
+- [x] 23 tests all passing
 
-### Week 15: Document Generation (Phase 6)
-- [ ] POST /trips/:id/document — generates .docx, uploads to R2, saves itinerary_versions row
-- [ ] Google Maps Static API integration for day maps (addresses, not venue names)
-- [ ] Web: "Generate Document" button; download link on completion
+### Week 15: Document Generation (Phase 6) ✅
+- [x] `apps/api/src/services/docxGenerator.ts` — markdown → DOCX (docx package); Google Maps Static API for day maps (addresses, not venue names; SSRF protection)
+- [x] `apps/api/src/lib/r2.ts` — uploadDocxToR2, downloadR2AsBuffer
+- [x] POST /trips/:id/document — generates DOCX, uploads to R2, saves docx_r2_key, advances status to 'review'
+- [x] GET /trips/:id/document — returns latest document metadata or null
+- [x] GET /trips/:id/document/download — authenticated download proxy (no presigned URLs; requires Clerk JWT)
+- [x] Web: DocumentPanel on TripPage — "Generate document" button, download link; apiDownload() in api.ts
+- [x] 25 tests all passing
 
-### Week 16: Revision Flow (Phase 7)
-- [ ] POST /trips/:id/revise — balanced tier; takes client feedback, returns diff
-- [ ] Writes itinerary-v[N+1].md and triggers document re-generation
-- [ ] Web: feedback input panel; version history list
+### Week 16: Revision Flow (Phase 7) ✅
+- [x] `apps/api/src/services/revisionPrompt.ts` — system prompt + user message builder (current itinerary + feedback + booking constraints)
+- [x] `POST /trips/:id/revise/stream` — balanced tier; gate: status must be draft/review/complete; saves as v[N+1]; advances draft→review; never overwrites
+- [x] Web: RevisionPanel on TripPage — feedback textarea, streaming display, "Make another revision" after done
+- [x] Web: VersionHistoryCard — replaces old version list; shows all versions sorted descending, per-version .docx download button (if document exists)
+- [x] 23 tests all passing (first run, zero failures)
 
-### Weeks 17–18: Context Manager + Streaming Polish
-- [ ] Context manager — caps token budget per phase, summarises prior context when over limit
-- [ ] Streaming error recovery (reconnect on drop)
-- [ ] AI usage logging (token counts per trip, per phase) — not PII
+### Weeks 17–18: Context Manager + Streaming Polish ✅
+- [x] `apps/api/src/services/contextManager.ts` — `fitToTokenBudget()` + `estimateTokens()`; budgets: draft.researchNotes=8000, revision.currentItinerary=10000
+- [x] Context manager integrated in `draft.ts` (research notes) and `revise.ts` (current itinerary); truncation logged as warning
+- [x] Keep-alive ping: `{ type: 'ping' }` SSE every 15 s on all three streaming endpoints, cleared on first chunk
+- [x] Streaming error recovery: `?resumeFrom=charOffset` query param on all three streaming endpoints; replays saved content from offset; falls through to fresh generation if no saved content
+- [x] AI usage logging: `input_tokens`, `output_tokens`, `model_used` saved on `research_notes` (was already designed); new migration adds same columns to `itinerary_versions`
+- [x] `AnthropicProvider.streamWithUsage()` — `StreamHandle` class wrapping Anthropic message stream; `getUsage()` method called after iteration
+- [x] `supabase/migrations/20260420000004_itinerary_versions_token_columns.sql` — adds three columns
+- [x] `apps/api/src/services/contextManager.test.ts` — 13 unit tests, all passing
+- [x] Route tests updated: `streamWithUsage` mock across research/draft/revise; 9 new tests (usage logging, resume); vi.clearAllMocks() added to research.test.ts and draft.test.ts
+- [x] 114 tests all passing (first run after fixes: 3 failures resolved — all mock call-count isolation)
 
 ---
 
@@ -185,33 +199,13 @@
 
 ## Immediate Next Actions (start of next session)
 
-1. **Run Supabase migration** (if not done yet):
-   ```sql
-   -- File: supabase/migrations/20260420000002_clients_contact_fields.sql
-   alter table clients
-     add column if not exists phone        text not null default '',
-     add column if not exists address_line text not null default '',
-     add column if not exists city         text not null default '',
-     add column if not exists country      text not null default '',
-     add column if not exists postal_code  text not null default '';
-   ```
+**All Supabase migrations are up to date** — nothing to run before starting.
 
-2. **Begin Week 10** — Trip workspace page (`apps/web/src/pages/TripPage.tsx`)
+**Current test suite:** 114 tests across 6 files, all passing.  
+Run with: `pnpm --filter @trip-planner/api test`
 
-3. **Route to add** in `apps/web/src/App.tsx`:
-   ```tsx
-   <Route path="/trips/:id" element={<TripPage />} />
-   ```
+**Next task: Sprint 4 — Client Portal (Weeks 19–20)**
 
-4. **API shape** for `GET /trips/:id` response (already implemented):
-   ```typescript
-   {
-     id, destination, destination_slug, destination_country, departure_city,
-     start_date, end_date, duration_days, purpose, purpose_notes,
-     status, documents_ingested, created_at, updated_at,
-     clients: { consultant_id },
-     brief: { brief_json, version, created_at } | null,
-     bookings: Booking[],
-     itineraryVersions: { id, version_number, docx_r2_key, created_at }[]
-   }
-   ```
+1. **Read-only shareable trip link** — no Clerk account needed; token-based auth for client portal URLs
+2. **Client portal page** — itinerary viewer (final version only, read-only)
+3. **PDF export option** — for clients to download a PDF version of the itinerary

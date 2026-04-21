@@ -95,3 +95,41 @@ export async function deleteFromR2(r2Key: string): Promise<void> {
     new DeleteObjectCommand({ Bucket: BUCKET(), Key: r2Key }),
   );
 }
+
+/**
+ * Upload a generated DOCX buffer to R2.
+ * Key format: `itineraries/{tripId}/{uuid}.docx` — never user-controlled.
+ * Returns the R2 key.
+ */
+export async function uploadDocxToR2(buffer: Buffer, tripId: string): Promise<string> {
+  const key = `itineraries/${tripId}/${randomUUID()}.docx`;
+
+  await getR2Client().send(
+    new PutObjectCommand({
+      Bucket: BUCKET(),
+      Key: key,
+      Body: buffer,
+      ContentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    }),
+  );
+
+  return key;
+}
+
+/**
+ * Download an R2 object and return it as a Buffer.
+ * Used for the authenticated DOCX download proxy endpoint.
+ */
+export async function downloadR2AsBuffer(r2Key: string): Promise<Buffer> {
+  const response = await getR2Client().send(
+    new GetObjectCommand({ Bucket: BUCKET(), Key: r2Key }),
+  );
+
+  if (!response.Body) throw new Error(`Empty response body for R2 key: ${r2Key}`);
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of response.Body as Readable) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}

@@ -5,7 +5,9 @@ import { SignInPage } from './pages/SignInPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { ClientsPage } from './pages/ClientsPage';
 import { NewTripPage } from './pages/NewTripPage';
+import { TripPage } from './pages/TripPage';
 import { LoadingSpinner } from './components/ui/LoadingSpinner';
+import { ErrorBoundary } from './components/ui/ErrorBoundary';
 
 /** Wraps routes that require authentication. */
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -31,10 +33,10 @@ export default function App() {
           </ProtectedRoute>
         }
       >
-        <Route index element={<DashboardPage />} />
-        <Route path="trips/:id" element={<div className="text-gray-500 p-8">Trip detail — coming soon</div>} />
-        <Route path="trips/new"  element={<NewTripPage />} />
-        <Route path="clients"    element={<ClientsPage />} />
+        <Route index element={<ErrorBoundary><DashboardPage /></ErrorBoundary>} />
+        <Route path="trips/:id" element={<ErrorBoundary><TripPage /></ErrorBoundary>} />
+        <Route path="trips/new"  element={<ErrorBoundary><NewTripPage /></ErrorBoundary>} />
+        <Route path="clients"    element={<ErrorBoundary><ClientsPage /></ErrorBoundary>} />
       </Route>
 
       {/* Fallback */}

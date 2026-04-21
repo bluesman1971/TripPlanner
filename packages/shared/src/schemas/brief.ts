@@ -4,7 +4,7 @@ const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
 const timeRegex = /^\d{2}:\d{2}$/;
 
 export const TripStatusSchema = z.enum([
-  'setup', 'ingestion', 'research', 'verification', 'draft', 'revision', 'delivered',
+  'setup', 'ingestion', 'research', 'draft', 'review', 'complete',
 ]);
 
 export const TripPurposeSchema = z.enum([

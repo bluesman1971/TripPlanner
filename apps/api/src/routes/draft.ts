@@ -1,0 +1,271 @@
+import type { FastifyInstance } from 'fastify';
+import { getAuth } from '@clerk/fastify';
+import { AnthropicProvider } from '../ai/anthropic.provider';
+import { MODEL_CONFIG } from '../config/models';
+import { getSupabase } from '../lib/supabase';
+import { getOrCreateConsultant } from '../lib/consultant';
+import { safeError } from '../lib/logger';
+import { requireAuth } from '../middleware/auth';
+import { DRAFT_SYSTEM_PROMPT, buildDraftUserMessage } from '../services/draftPrompt';
+import { fitToTokenBudget, CONTEXT_BUDGETS } from '../services/contextManager';
+
+const provider = new AnthropicProvider();
+
+const PING_INTERVAL_MS = 15_000;
+const REPLAY_CHUNK_SIZE = 512;
+
+function writeSSE(raw: NodeJS.WritableStream, event: Record<string, unknown>) {
+  raw.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
+/** Returns the trip row if it belongs to the consultant, null otherwise. */
+async function getTripForConsultant(
+  tripId: string,
+  consultantId: string,
+  supabase: ReturnType<typeof getSupabase>,
+) {
+  const { data } = await supabase
+    .from('trips')
+    .select(`
+      id, destination, destination_country, departure_city,
+      start_date, end_date, duration_days,
+      purpose, purpose_notes, status,
+      clients!inner(consultant_id)
+    `)
+    .eq('id', tripId)
+    .eq('clients.consultant_id', consultantId)
+    .single();
+  return data;
+}
+
+export async function draftRoutes(app: FastifyInstance) {
+
+  // POST /trips/:id/draft/stream
+  // Streams a full itinerary draft using the quality tier.
+  // Gate: trip status must be 'research'.
+  // Query param: ?resumeFrom=N — if a saved draft exists, replay from char offset N
+  //   instead of running a fresh AI call. Gate is bypassed for resume paths.
+  // Returns SSE: { type: 'chunk', text } | { type: 'done', versionNumber } | { type: 'ping' } | { type: 'error', message }
+  app.post(
+    '/trips/:id/draft/stream',
+    { preHandler: [requireAuth] },
+    async (request, reply) => {
+      const { id: tripId } = request.params as { id: string };
+      const { resumeFrom } = request.query as { resumeFrom?: string };
+      const { userId } = getAuth(request);
+      const supabase = getSupabase();
+      const consultant = await getOrCreateConsultant(userId!, supabase);
+
+      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      if (!trip) {
+        return reply.status(404).send({ error: 'Trip not found' });
+      }
+
+      // ── Resume path: replay saved draft from offset ──────────────────────────
+      const resumeOffset = resumeFrom !== undefined ? parseInt(resumeFrom, 10) : NaN;
+      if (!Number.isNaN(resumeOffset)) {
+        const { data: savedVersion } = await supabase
+          .from('itinerary_versions')
+          .select('version_number, markdown_content')
+          .eq('trip_id', tripId)
+          .order('version_number', { ascending: false })
+          .limit(1)
+          .single();
+
+        if (savedVersion?.markdown_content) {
+          const tail = savedVersion.markdown_content.slice(resumeOffset);
+          reply.raw.setHeader('Content-Type', 'text/event-stream');
+          reply.raw.setHeader('Cache-Control', 'no-cache');
+          reply.raw.setHeader('Connection', 'keep-alive');
+          reply.raw.setHeader('X-Accel-Buffering', 'no');
+          reply.raw.setHeader(
+            'Access-Control-Allow-Origin',
+            process.env.CORS_ORIGIN || 'http://localhost:5174',
+          );
+          reply.hijack();
+          reply.raw.flushHeaders();
+
+          for (let i = 0; i < tail.length; i += REPLAY_CHUNK_SIZE) {
+            writeSSE(reply.raw, { type: 'chunk', text: tail.slice(i, i + REPLAY_CHUNK_SIZE) });
+          }
+          writeSSE(reply.raw, { type: 'done', versionNumber: savedVersion.version_number });
+          reply.raw.end();
+          return;
+        }
+        // No saved draft — fall through to gate check + fresh generation
+      }
+
+      // ── Gate check ───────────────────────────────────────────────────────────
+      if (trip.status !== 'research') {
+        return reply.status(400).send({
+          error: `Cannot generate draft: trip status is '${trip.status}'. Research must be complete first.`,
+        });
+      }
+
+      // ── Fetch context ─────────────────────────────────────────────────────
+      const [briefResult, bookingsResult, researchResult, latestVersionResult] =
+        await Promise.all([
+          supabase
+            .from('trip_brief')
+            .select('brief_json')
+            .eq('trip_id', tripId)
+            .order('version', { ascending: false })
+            .limit(1)
+            .single(),
+
+          supabase
+            .from('bookings')
+            .select('booking_slug, booking_type, date, start_time, end_time, meeting_point_address, consultant_flags')
+            .eq('trip_id', tripId)
+            .order('date', { ascending: true }),
+
+          supabase
+            .from('research_notes')
+            .select('content')
+            .eq('trip_id', tripId)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .single(),
+
+          supabase
+            .from('itinerary_versions')
+            .select('version_number')
+            .eq('trip_id', tripId)
+            .order('version_number', { ascending: false })
+            .limit(1)
+            .single(),
+        ]);
+
+      const briefJson = (briefResult.data?.brief_json ?? {}) as Record<string, unknown>;
+      const travelerProfile = briefJson.traveler_profile as Record<string, unknown> | undefined;
+      const bookings = (bookingsResult.data ?? []) as Parameters<typeof buildDraftUserMessage>[0]['bookings'];
+      const rawResearchContent = researchResult.data?.content ?? '';
+      const nextVersionNumber = ((latestVersionResult.data?.version_number as number | null) ?? 0) + 1;
+
+      if (!rawResearchContent) {
+        return reply.status(400).send({
+          error: 'Cannot generate draft: no research notes found. Run research first.',
+        });
+      }
+
+      // ── Apply context budget to research notes ───────────────────────────────
+      const { content: researchContent, truncated } = fitToTokenBudget(
+        rawResearchContent,
+        CONTEXT_BUDGETS.draft.researchNotes,
+      );
+      if (truncated) {
+        app.log.warn({ tripId }, 'research notes truncated to fit draft context budget');
+      }
+
+      const userMessage = buildDraftUserMessage({
+        destination: trip.destination as string,
+        destination_country: trip.destination_country as string,
+        start_date: trip.start_date as string | null,
+        end_date: trip.end_date as string | null,
+        duration_days: trip.duration_days as number | null,
+        purpose: trip.purpose as string,
+        purpose_notes: trip.purpose_notes as string,
+        travelerProfile: (travelerProfile as unknown) as Parameters<typeof buildDraftUserMessage>[0]['travelerProfile'],
+        bookings,
+        researchContent,
+      });
+
+      // ── Switch to SSE ─────────────────────────────────────────────────────
+      reply.raw.setHeader('Content-Type', 'text/event-stream');
+      reply.raw.setHeader('Cache-Control', 'no-cache');
+      reply.raw.setHeader('Connection', 'keep-alive');
+      reply.raw.setHeader('X-Accel-Buffering', 'no');
+      reply.raw.setHeader(
+        'Access-Control-Allow-Origin',
+        process.env.CORS_ORIGIN || 'http://localhost:5174',
+      );
+
+      reply.hijack();
+      reply.raw.flushHeaders();
+
+      let fullContent = '';
+      let firstChunk = true;
+      let pingTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
+        if (firstChunk) writeSSE(reply.raw, { type: 'ping' });
+      }, PING_INTERVAL_MS);
+
+      const stopPing = () => {
+        if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
+      };
+
+      try {
+        const handle = provider.streamWithUsage(
+          {
+            system: DRAFT_SYSTEM_PROMPT,
+            messages: [{ role: 'user', content: userMessage }],
+            maxTokens: 12000,
+          },
+          { model: MODEL_CONFIG.quality.model },
+        );
+
+        for await (const chunk of handle) {
+          if (firstChunk) { firstChunk = false; stopPing(); }
+          fullContent += chunk.text;
+          writeSSE(reply.raw, { type: 'chunk', text: chunk.text });
+        }
+
+        const usage = await handle.getUsage();
+
+        // ── Save draft version (never overwrite — always new version) ─────────
+        await supabase
+          .from('itinerary_versions')
+          .insert({
+            trip_id: tripId,
+            version_number: nextVersionNumber,
+            markdown_content: fullContent,
+            input_tokens: usage.inputTokens,
+            output_tokens: usage.outputTokens,
+            model_used: usage.model,
+          });
+
+        // ── Advance trip status ───────────────────────────────────────────────
+        await supabase
+          .from('trips')
+          .update({ status: 'draft', updated_at: new Date().toISOString() })
+          .eq('id', tripId);
+
+        writeSSE(reply.raw, { type: 'done', versionNumber: nextVersionNumber });
+
+      } catch (err) {
+        app.log.error(safeError(err));
+        writeSSE(reply.raw, { type: 'error', message: 'Draft generation failed. Please try again.' });
+      } finally {
+        stopPing();
+        reply.raw.end();
+      }
+    },
+  );
+
+  // GET /trips/:id/draft
+  // Returns the latest saved draft (markdown_content + version metadata).
+  app.get(
+    '/trips/:id/draft',
+    { preHandler: [requireAuth] },
+    async (request, reply) => {
+      const { id: tripId } = request.params as { id: string };
+      const { userId } = getAuth(request);
+      const supabase = getSupabase();
+      const consultant = await getOrCreateConsultant(userId!, supabase);
+
+      const trip = await getTripForConsultant(tripId, consultant.id, supabase);
+      if (!trip) {
+        return reply.status(404).send({ error: 'Trip not found' });
+      }
+
+      const { data: draft } = await supabase
+        .from('itinerary_versions')
+        .select('id, version_number, markdown_content, created_at')
+        .eq('trip_id', tripId)
+        .order('version_number', { ascending: false })
+        .limit(1)
+        .single();
+
+      return reply.send(draft ?? null);
+    },
+  );
+}
