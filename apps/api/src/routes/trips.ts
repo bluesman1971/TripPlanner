@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { getAuth } from '@clerk/fastify';
 import { z } from 'zod';
-import { TripPurposeSchema, TripStatusSchema, DiscoverySchema } from '@trip-planner/shared';
+import { TripPurposeSchema, TripStatusSchema, DiscoverySchema, TravelerProfileSchema } from '@trip-planner/shared';
 import { getSupabase } from '../lib/supabase';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
@@ -23,6 +23,7 @@ const CreateTripSchema = z.object({
   purpose: TripPurposeSchema,
   purposeNotes: z.string().default(''),
   discovery: DiscoverySchema,
+  travelerProfile: TravelerProfileSchema,
 });
 
 const UpdateBriefSchema = z.object({
@@ -150,6 +151,7 @@ export async function tripRoutes(app: FastifyInstance) {
       status: 'setup',
       documents_ingested: false,
       discovery: parsed.data.discovery,
+      traveler_profile: parsed.data.travelerProfile,
       pre_booked: [],
       version_history: [{ date: new Date().toISOString().slice(0, 10), note: 'Trip created' }],
     };

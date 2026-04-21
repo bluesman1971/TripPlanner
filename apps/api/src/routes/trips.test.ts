@@ -122,6 +122,17 @@ describe('trips routes', () => {
         purpose: 'anniversary',
         purposeNotes: 'Wedding anniversary. First stop of a cruise vacation.',
         discovery: barcelonaDiscovery,
+        travelerProfile: {
+          travelers: [{ role: 'primary', age_group: '40s', notes: '' }],
+          daily_walking: 'medium',
+          activity_level: 'moderate',
+          physical_limitations: '',
+          interests: ['food-wine', 'architecture'],
+          dietary_restrictions: [],
+          dining_style: 'mixed',
+          budget_tier: 'upscale',
+          itinerary_pace: 'balanced',
+        },
       },
     });
 
