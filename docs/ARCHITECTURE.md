@@ -265,7 +265,9 @@ to `content` to match application code.
 | `20260420000002_clients_contact_fields.sql` | Add phone, address_line, city, country, postal_code to clients | ✅ Run |
 | `20260420000003_research_notes_rename_column.sql` | Rename `content_markdown` → `content` in research_notes | ✅ Run |
 | `20260420000004_itinerary_versions_token_columns.sql` | Add input_tokens, output_tokens, model_used to itinerary_versions | ✅ Run |
-| `20260421000005_portal_tokens.sql` | portal_tokens table for shareable client links | ⏳ Pending |
+| `20260421000005_portal_tokens.sql` | portal_tokens table for shareable client links | ✅ Run |
+| `20260421000006_consultant_email_notifications.sql` | adds `email_notifications boolean DEFAULT true` to consultants | ✅ Run |
+| `20260422000007_add_fk_indexes.sql` | FK indexes on bookings, itinerary_versions, research_notes, trip_brief, documents, trips, clients | ⏳ Pending |
 
 ---
 
