@@ -185,8 +185,9 @@ describe('document routes', () => {
     mockQueueAdd.mockResolvedValue({ id: FAKE_JOB_ID });
     mockDownloadR2AsBuffer.mockResolvedValue(Buffer.from('MOCK_DOCX_CONTENT'));
 
-    // Default: job is active (not yet done)
+    // Default: job is active (not yet done) and belongs to this trip
     mockQueueGetJob.mockResolvedValue({
+      data: { tripId: TRIP_ID, consultantId: CONSULTANT_ID },
       getState: async () => 'active',
       returnvalue: null,
     });
@@ -246,6 +247,17 @@ describe('document routes', () => {
     mockTrip.clients.consultant_id = OTHER_CONSULTANT_ID;
     const res = await app.inject({ method: 'GET', url: `/trips/${TRIP_ID}/document/job/${FAKE_JOB_ID}` });
     expect(res.statusCode).toBe(404);
+  });
+
+  it('GET /document/job/:jobId returns 404 when job belongs to a different trip (IDOR on job)', async () => {
+    mockQueueGetJob.mockResolvedValueOnce({
+      data: { tripId: 'different-trip-id', consultantId: CONSULTANT_ID },
+      getState: async () => 'completed',
+      returnvalue: { versionNumber: 99, downloadPath: '/trips/other/document/download' },
+    });
+    const res = await app.inject({ method: 'GET', url: `/trips/${TRIP_ID}/document/job/${FAKE_JOB_ID}` });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toMatch(/job not found/i);
   });
 
   it('POST /document returns 404 for a non-existent trip ID', async () => {
@@ -329,7 +341,7 @@ describe('document routes', () => {
   });
 
   it('GET /document/job/:jobId returns active status while job is running', async () => {
-    mockQueueGetJob.mockResolvedValueOnce({ getState: async () => 'active', returnvalue: null });
+    mockQueueGetJob.mockResolvedValueOnce({ data: { tripId: TRIP_ID }, getState: async () => 'active', returnvalue: null });
     const res = await app.inject({ method: 'GET', url: `/trips/${TRIP_ID}/document/job/${FAKE_JOB_ID}` });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { status: string };
@@ -337,7 +349,7 @@ describe('document routes', () => {
   });
 
   it('GET /document/job/:jobId returns waiting status when job is queued', async () => {
-    mockQueueGetJob.mockResolvedValueOnce({ getState: async () => 'waiting', returnvalue: null });
+    mockQueueGetJob.mockResolvedValueOnce({ data: { tripId: TRIP_ID }, getState: async () => 'waiting', returnvalue: null });
     const res = await app.inject({ method: 'GET', url: `/trips/${TRIP_ID}/document/job/${FAKE_JOB_ID}` });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { status: string };
@@ -347,6 +359,7 @@ describe('document routes', () => {
   it('GET /document/job/:jobId returns completed with result', async () => {
     const mockResult = { versionNumber: 1, downloadPath: `/trips/${TRIP_ID}/document/download` };
     mockQueueGetJob.mockResolvedValueOnce({
+      data: { tripId: TRIP_ID },
       getState: async () => 'completed',
       returnvalue: mockResult,
     });
@@ -359,7 +372,7 @@ describe('document routes', () => {
   });
 
   it('GET /document/job/:jobId returns failed status with generic message', async () => {
-    mockQueueGetJob.mockResolvedValueOnce({ getState: async () => 'failed', returnvalue: null });
+    mockQueueGetJob.mockResolvedValueOnce({ data: { tripId: TRIP_ID }, getState: async () => 'failed', returnvalue: null });
     const res = await app.inject({ method: 'GET', url: `/trips/${TRIP_ID}/document/job/${FAKE_JOB_ID}` });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { status: string; error: string };

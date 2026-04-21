@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import path from 'path';
 import { getAuth } from '@clerk/fastify';
-import { getDB } from '../services/db';
+import { getDB, getTripForConsultant } from '../services/db';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { uploadToR2 } from '../lib/r2';
 import { getIngestQueue } from '../queues/ingest.queue';
@@ -106,16 +106,28 @@ export async function bookingRoutes(app: FastifyInstance) {
   );
 
   // ── GET /trips/:tripId/bookings/job/:jobId ────────────────────────────────
-  // Poll for job status.
+  // Poll for job status. Verifies trip ownership before exposing any job data.
   app.get(
     '/trips/:tripId/bookings/job/:jobId',
     { preHandler: [requireAuth] },
     async (request, reply) => {
-      const { jobId } = request.params as { tripId: string; jobId: string };
+      const { tripId, jobId } = request.params as { tripId: string; jobId: string };
+      const { userId } = getAuth(request);
+      const supabase = getDB();
+      const consultant = await getOrCreateConsultant(userId!, supabase);
+
+      const trip = await getTripForConsultant(supabase, tripId, consultant.id);
+      if (!trip) return reply.status(404).send({ error: 'Trip not found' });
+
       const queue = getIngestQueue();
       const job = await queue.getJob(jobId);
 
       if (!job) {
+        return reply.status(404).send({ error: 'Job not found' });
+      }
+
+      // Prevent cross-tenant job data leak: confirm the job belongs to this trip
+      if (job.data?.tripId !== tripId || job.data?.consultantId !== consultant.id) {
         return reply.status(404).send({ error: 'Job not found' });
       }
 

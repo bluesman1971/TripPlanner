@@ -92,6 +92,11 @@ export async function documentRoutes(app: FastifyInstance) {
           return reply.status(404).send({ error: 'Job not found' });
         }
 
+        // Prevent cross-tenant job data leak: confirm the job belongs to this trip
+        if (job.data?.tripId !== tripId) {
+          return reply.status(404).send({ error: 'Job not found' });
+        }
+
         const state = await job.getState();
 
         if (state === 'completed') {

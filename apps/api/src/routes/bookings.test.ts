@@ -26,10 +26,13 @@ vi.mock('../lib/r2', () => ({
 }));
 
 // ─── Mock BullMQ queue ────────────────────────────────────────────────────────
+const mockIngestQueueAdd    = vi.fn(async () => ({ id: 'job-123' }));
+const mockIngestQueueGetJob = vi.fn(async () => null as unknown);
+
 vi.mock('../queues/ingest.queue', () => ({
   getIngestQueue: () => ({
-    add: vi.fn(async () => ({ id: 'job-123' })),
-    getJob: vi.fn(async () => null),
+    add:    mockIngestQueueAdd,
+    getJob: mockIngestQueueGetJob,
   }),
   INGEST_QUEUE_NAME: 'ingest',
 }));
@@ -355,6 +358,96 @@ describe('POST /trips/:tripId/bookings/manual', () => {
     expect(body.booking_type).toBe('tour');
     expect(insertedBookings.length).toBe(1);
     expect(insertedBookings[0].trip_id).toBe(TRIP_ID);
+  });
+});
+
+// ─── GET /trips/:tripId/bookings/job/:jobId ───────────────────────────────────
+
+const JOB_ID = 'job-123';
+
+describe('GET /trips/:tripId/bookings/job/:jobId', () => {
+  it('returns 401 when unauthenticated', async () => {
+    mockGetAuth.mockReturnValue({ userId: undefined });
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/trips/${TRIP_ID}/bookings/job/${JOB_ID}`,
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('returns 404 when trip belongs to a different consultant (IDOR on trip)', async () => {
+    mockTripData = null;
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/trips/${TRIP_ID}/bookings/job/${JOB_ID}`,
+      headers: { authorization: 'Bearer test' },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('returns 404 when job does not exist', async () => {
+    mockIngestQueueGetJob.mockResolvedValueOnce(null);
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/trips/${TRIP_ID}/bookings/job/${JOB_ID}`,
+      headers: { authorization: 'Bearer test' },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toMatch(/job not found/i);
+  });
+
+  it('returns 404 when job belongs to a different trip (IDOR on job)', async () => {
+    mockIngestQueueGetJob.mockResolvedValueOnce({
+      data: { tripId: 'different-trip-id', consultantId: CONSULTANT_ID },
+      getState: async () => 'active',
+      progress: 0,
+      returnvalue: null,
+    });
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/trips/${TRIP_ID}/bookings/job/${JOB_ID}`,
+      headers: { authorization: 'Bearer test' },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toMatch(/job not found/i);
+  });
+
+  it('returns 404 when job belongs to a different consultant (IDOR on job)', async () => {
+    mockIngestQueueGetJob.mockResolvedValueOnce({
+      data: { tripId: TRIP_ID, consultantId: OTHER_CONSULTANT_ID },
+      getState: async () => 'active',
+      progress: 0,
+      returnvalue: null,
+    });
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/trips/${TRIP_ID}/bookings/job/${JOB_ID}`,
+      headers: { authorization: 'Bearer test' },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toMatch(/job not found/i);
+  });
+
+  it('returns job status when job belongs to this trip and consultant', async () => {
+    mockIngestQueueGetJob.mockResolvedValueOnce({
+      data: { tripId: TRIP_ID, consultantId: CONSULTANT_ID },
+      getState: async () => 'active',
+      progress: 50,
+      returnvalue: null,
+    });
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/trips/${TRIP_ID}/bookings/job/${JOB_ID}`,
+      headers: { authorization: 'Bearer test' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe('active');
   });
 });
 
