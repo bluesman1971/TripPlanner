@@ -6,6 +6,7 @@ import { getSupabase } from '../lib/supabase';
 import { getOrCreateConsultant } from '../lib/consultant';
 import { safeError } from '../lib/logger';
 import { requireAuth } from '../middleware/auth';
+import { deleteFromR2 } from '../lib/r2';
 
 // ─── Request schemas ──────────────────────────────────────────────────────────
 
@@ -287,5 +288,50 @@ export async function tripRoutes(app: FastifyInstance) {
     }
 
     return reply.send(newBrief);
+  });
+
+  // DELETE /trips/:id — delete a trip and all associated R2 files
+  app.delete('/trips/:id', { preHandler: [requireAuth] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { userId } = getAuth(request);
+    const supabase = getSupabase();
+    const consultant = await getOrCreateConsultant(userId!, supabase);
+
+    const trip = await getTripForConsultant(id, consultant.id, supabase);
+    if (!trip) {
+      return reply.status(404).send({ error: 'Trip not found' });
+    }
+
+    // Gather all R2 keys for cleanup before deleting DB rows
+    const { data: documents } = await supabase
+      .from('documents')
+      .select('r2_key')
+      .eq('trip_id', id);
+
+    const { data: itineraries } = await supabase
+      .from('itinerary_versions')
+      .select('docx_r2_key')
+      .eq('trip_id', id);
+
+    // Delete the trip row — FK cascades handle bookings, briefs, research_notes, etc.
+    const { error: deleteError } = await supabase
+      .from('trips')
+      .delete()
+      .eq('id', id);
+
+    if (deleteError) {
+      app.log.error(safeError(deleteError));
+      return reply.status(500).send({ error: 'Failed to delete trip' });
+    }
+
+    // Best-effort R2 cleanup after DB rows are gone
+    const r2Keys = [
+      ...(documents ?? []).map((d) => d.r2_key).filter(Boolean),
+      ...(itineraries ?? []).map((v) => v.docx_r2_key).filter(Boolean),
+    ];
+
+    await Promise.allSettled(r2Keys.map((key) => deleteFromR2(key as string)));
+
+    return reply.status(204).send();
   });
 }

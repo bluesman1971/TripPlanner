@@ -4,6 +4,87 @@ import path from 'path';
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.tiff', '.bmp']);
 const TEXT_EXTS  = new Set(['.txt', '.md', '.csv', '.tsv', '.json', '.eml']);
 
+// ─── Pre-upload readability check ────────────────────────────────────────────
+
+export type FileReadabilityCheck =
+  | { ok: true }
+  | { ok: false; guidance: string };
+
+/**
+ * Validates that a file buffer is readable before it is uploaded to R2.
+ * Returns { ok: true } if we can extract text, or { ok: false, guidance } with
+ * a user-friendly message explaining what to do instead.
+ * Called synchronously in the upload route so failures surface immediately.
+ */
+export async function checkFileReadable(
+  buffer: Buffer,
+  ext: string,
+): Promise<FileReadabilityCheck> {
+  // Images are always accepted — vision extraction handles them
+  if (IMAGE_EXTS.has(ext)) return { ok: true };
+
+  if (ext === '.pdf') {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pdfParse = require('pdf-parse') as (buf: Buffer) => Promise<{ text: string }>;
+    let text: string;
+    try {
+      const result = await pdfParse(buffer);
+      text = result.text ?? '';
+    } catch {
+      return {
+        ok: false,
+        guidance:
+          'This PDF uses a format we can\'t read — it may contain complex graphics or ' +
+          'security settings. The easiest fix: open the booking confirmation in your browser, ' +
+          'then File → Save Page As → "Webpage, HTML Only" and upload the .html file instead.',
+      };
+    }
+    if (text.trim().length < 100) {
+      return {
+        ok: false,
+        guidance:
+          'This PDF appears to be image-based with no extractable text. ' +
+          'Please get the digital version from the booking platform — most show a ' +
+          '"View online" or "Download" button that produces a readable PDF. ' +
+          'Alternatively, copy the booking details into a .txt file.',
+      };
+    }
+    return { ok: true };
+  }
+
+  if (ext === '.docx' || ext === '.doc') {
+    try {
+      const mammoth = await import('mammoth');
+      const result = await mammoth.extractRawText({ buffer });
+      if (result.value.trim().length < 20) {
+        return {
+          ok: false,
+          guidance:
+            'This Word document appears to be empty or image-only. ' +
+            'Try saving it as plain text (.txt) or copying the content into a new document.',
+        };
+      }
+    } catch {
+      return {
+        ok: false,
+        guidance:
+          'We couldn\'t read this Word document. ' +
+          'Try saving it as a .txt or .html file and uploading that instead.',
+      };
+    }
+    return { ok: true };
+  }
+
+  if (TEXT_EXTS.has(ext) || ext === '.html' || ext === '.htm') {
+    if (buffer.toString('utf-8').trim().length < 20) {
+      return { ok: false, guidance: 'This file appears to be empty.' };
+    }
+    return { ok: true };
+  }
+
+  return { ok: true };
+}
+
 export function isImageFile(filename: string): boolean {
   return IMAGE_EXTS.has(path.extname(filename).toLowerCase());
 }
@@ -19,14 +100,18 @@ export async function extractText(filePath: string): Promise<string | null> {
 
   // ── PDF ──────────────────────────────────────────────────────────────────
   if (ext === '.pdf') {
-    // pdf-parse v2 ships its own types; use require to avoid ESM/CJS mismatch
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
-    const pdfMod = require('pdf-parse') as any;
-    const pdfParse: (buf: Buffer) => Promise<{ text: string }> =
-      typeof pdfMod === 'function' ? pdfMod : (pdfMod.default ?? pdfMod);
+    // pdf-parse v1 exports the function directly as module.exports; require() is correct here
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pdfParse = require('pdf-parse') as (buf: Buffer) => Promise<{ text: string }>;
     const buffer = readFileSync(filePath);
-    const result = await pdfParse(buffer);
-    return result.text ?? null;
+    try {
+      const result = await pdfParse(buffer);
+      return result.text ?? null;
+    } catch {
+      // pdfjs-dist (bundled with pdf-parse v1) cannot parse all PDF 1.7+ features.
+      // Return null so the worker surfaces a user-friendly "scanned/image PDF" message.
+      return null;
+    }
   }
 
   // ── DOCX / DOC ───────────────────────────────────────────────────────────

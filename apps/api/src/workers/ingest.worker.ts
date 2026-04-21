@@ -1,5 +1,6 @@
 import { Worker, type Job } from 'bullmq';
-import { unlinkSync } from 'fs';
+import { unlinkSync, readFileSync } from 'fs';
+import path from 'path';
 import { getRedis } from '../lib/redis';
 import { getSupabase } from '../lib/supabase';
 import { downloadFromR2ToTemp } from '../lib/r2';
@@ -8,6 +9,50 @@ import { parseBookingDocument } from '../services/bookingParser';
 import { encryptJson, encrypt } from '../lib/encryption';
 import { safeError } from '../lib/logger';
 import { type IngestJobData, type IngestJobResult, INGEST_QUEUE_NAME } from '../queues/ingest.queue';
+import Anthropic from '@anthropic-ai/sdk';
+import { MODEL_CONFIG } from '../config/models';
+
+const IMAGE_MEDIA_TYPES: Record<string, string> = {
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png':  'image/png',
+  '.webp': 'image/webp',
+  '.gif':  'image/gif',
+};
+
+async function extractTextFromImage(filePath: string): Promise<string> {
+  const ext = path.extname(filePath).toLowerCase();
+  const mediaType = (IMAGE_MEDIA_TYPES[ext] ?? 'image/jpeg') as Anthropic.Base64ImageSource['media_type'];
+  const imageData = readFileSync(filePath).toString('base64');
+
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const cfg = MODEL_CONFIG.fast;
+
+  const response = await client.messages.create({
+    model: cfg.model,
+    max_tokens: 2048,
+    system: 'You are a booking document extractor. The user has uploaded a screenshot or photo of a booking confirmation. Transcribe all booking-relevant text from the image — dates, times, reference numbers, addresses, names, and any important notes. Output only the extracted text, no commentary.',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageData } },
+          { type: 'text', text: 'Please extract all booking information from this image.' },
+        ],
+      },
+    ],
+  });
+
+  const textBlock = response.content.find((b) => b.type === 'text');
+  const text = textBlock?.type === 'text' ? textBlock.text.trim() : '';
+  if (!text || text.length < 20) {
+    throw new Error(
+      'Could not extract readable text from the uploaded image. ' +
+      'Make sure the screenshot is clear and shows the full booking confirmation.',
+    );
+  }
+  return text;
+}
 
 async function processIngestJob(
   job: Job<IngestJobData, IngestJobResult>,
@@ -24,8 +69,7 @@ async function processIngestJob(
     let rawText: string;
 
     if (isImage) {
-      // Image files need Claude vision — full pipeline added in Sprint 3.
-      rawText = '[IMAGE FILE] — Vision-based extraction not yet implemented. Upload a text-based PDF or document instead.';
+      rawText = await extractTextFromImage(tempPath);
     } else {
       const extracted = await extractText(tempPath);
       if (!extracted || extracted.trim().length < 50) {

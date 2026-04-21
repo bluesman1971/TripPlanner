@@ -11,6 +11,7 @@ import { researchRoutes } from './routes/research';
 import { draftRoutes } from './routes/draft';
 import { documentRoutes } from './routes/document';
 import { revisionRoutes } from './routes/revise';
+import { portalRoutes } from './routes/portal';
 import { safeReqSerializer } from './lib/logger';
 
 export async function buildApp() {
@@ -63,6 +64,8 @@ export async function buildApp() {
   await app.register(draftRoutes);
   await app.register(documentRoutes);
   await app.register(revisionRoutes);
+  // Portal routes have both Clerk-protected (token create) and public (token view/pdf) endpoints
+  await app.register(portalRoutes);
 
   // Health check (no auth required)
   app.get('/health', async () => ({ status: 'ok' }));

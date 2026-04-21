@@ -79,7 +79,7 @@ Specific venues the client asked for. These must appear in the itinerary.
 
 ## CANDIDATE VENUES
 Organise by category relevant to the client's interests (e.g. Architecture, Markets, Museums, Dining, Hidden Gems). For each venue:
-- **Venue Name**
+- **Venue Name** · [Verify on Google](https://www.google.com/search?q=Venue+Name+City+Country)
   - Status: VERIFIED ✓ or NEEDS VERIFICATION ⚠
   - What: brief description
   - Why for [traveler type]: personalised justification
@@ -88,6 +88,8 @@ Organise by category relevant to the client's interests (e.g. Architecture, Mark
   - Reservations: required / recommended / not needed
   - Dietary note: only if relevant to client restrictions
   - Flags: anything the consultant must action or check
+
+IMPORTANT: For every venue, construct the Google search URL using the actual venue name and destination city/country, with spaces replaced by +. Example: for "Casa Batlló" in Barcelona, Spain → https://www.google.com/search?q=Casa+Batlló+Barcelona+Spain. Do NOT invent direct website URLs or Google Maps place IDs — only use this search URL pattern.
 
 Provide 2–3 candidates per category. Quality over quantity.
 

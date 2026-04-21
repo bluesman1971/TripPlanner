@@ -26,6 +26,7 @@ let mockConsultant = { id: CONSULTANT_ID, name: 'Tom Baker', email: 'tdbaker@gma
 let mockClient = { id: CLIENT_ID, name: 'Tom Baker', email: 'tdbaker@gmail.com', consultant_id: CONSULTANT_ID, created_at: '2026-04-20' };
 let mockTrips: Record<string, unknown>[] = [];
 let mockBriefs: Record<string, unknown>[] = [];
+let deletedTripIds: string[] = [];
 
 vi.mock('../lib/supabase', () => ({
   getSupabase: () => ({
@@ -40,6 +41,13 @@ vi.mock('../lib/supabase', () => ({
         if (t === 'trip_brief')  return { data: latestBrief(), error: null };
         return { data: null, error: null };
       };
+
+      // Stub cleanup tables used in DELETE /trips/:id
+      if (table === 'documents' || table === 'itinerary_versions') {
+        return {
+          select: () => ({ eq: () => ({ data: [], error: null }) }),
+        };
+      }
 
       return {
         select: () => ({
@@ -63,7 +71,6 @@ vi.mock('../lib/supabase', () => ({
             error: null,
           }),
         }),
-        // Push to in-memory state immediately on insert; also support chained .select().single()
         insert: (row: Record<string, unknown>) => {
           const record = { id: `${table}-${Date.now()}`, ...row, created_at: '2026-04-20' };
           if (table === 'trips')      mockTrips.push(record);
@@ -73,9 +80,22 @@ vi.mock('../lib/supabase', () => ({
           };
         },
         update: () => ({ eq: () => ({ data: null, error: null }) }),
+        delete: () => ({
+          eq: (_col: string, val: unknown) => {
+            if (table === 'trips') {
+              deletedTripIds.push(String(val));
+              mockTrips = mockTrips.filter((t) => t.id !== val);
+            }
+            return { data: null, error: null };
+          },
+        }),
       };
     },
   }),
+}));
+
+vi.mock('../lib/r2', () => ({
+  deleteFromR2: vi.fn(async () => {}),
 }));
 
 // ─── Barcelona fixture ────────────────────────────────────────────────────────
@@ -97,6 +117,7 @@ describe('trips routes', () => {
   beforeEach(async () => {
     mockTrips = [];
     mockBriefs = [];
+    deletedTripIds = [];
     app = await buildApp();
   });
 
@@ -152,6 +173,30 @@ describe('trips routes', () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(Array.isArray(body)).toBe(true);
+  });
+
+  it('DELETE /trips/:id returns 404 when trip belongs to another consultant (IDOR)', async () => {
+    // No trips seeded — ownership check returns null
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/trips/${TRIP_ID}`,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('DELETE /trips/:id deletes the trip and returns 204', async () => {
+    mockTrips = [{
+      id: TRIP_ID,
+      destination: 'Barcelona, Spain',
+      status: 'setup',
+      clients: { consultant_id: CONSULTANT_ID },
+    }];
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/trips/${TRIP_ID}`,
+    });
+    expect(res.statusCode).toBe(204);
+    expect(deletedTripIds).toContain(TRIP_ID);
   });
 
   it('PATCH /trips/:id/brief updates status to ingestion when documents_ingested is true', async () => {

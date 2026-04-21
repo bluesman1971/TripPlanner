@@ -35,7 +35,7 @@ export function useApi() {
     const response = await fetch(`${API_URL}${path}`, {
       ...options,
       headers: {
-        'Content-Type': 'application/json',
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...options.headers,
       },
@@ -99,7 +99,9 @@ export function useApi() {
       method: 'POST',
       ...options,
       headers: {
-        'Content-Type': 'application/json',
+        // Only set Content-Type when there's a body — Fastify v5 rejects
+        // 'application/json' with an empty body (FST_ERR_CTP_EMPTY_JSON_BODY)
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...options.headers,
       },
@@ -176,4 +178,24 @@ export function useApi() {
   }
 
   return { apiFetch, apiUpload, apiStream, apiDownload };
+}
+
+/**
+ * Fetch from the API without a Clerk JWT — for public endpoints like the client portal.
+ * Call this at the module level or inside plain async functions (not inside useApi).
+ */
+export async function apiPublicFetch<T>(path: string): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`);
+
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const body = await response.json();
+      message = (body as { error?: string }).error ?? message;
+    } catch { /* ignore */ }
+    throw new ApiError(response.status, message);
+  }
+
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
 }

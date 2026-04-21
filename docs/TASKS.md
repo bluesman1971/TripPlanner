@@ -1,8 +1,8 @@
 # TripPlanner — Project Task List
 
 > Last updated: 2026-04-21  
-> Current position: Sprint 3, Weeks 17–18 complete  
-> Next task: Sprint 4 — Client Portal (Weeks 19–20)
+> Current position: Sprint 4, Weeks 19–20 + live-debug session complete  
+> Next task: Sprint 4 — Email Notifications (Weeks 21–22)
 
 ---
 
@@ -169,11 +169,35 @@
 
 ## Sprint 4 — Polish + Launch (Weeks 19–26)
 
-### Weeks 19–20: Client Portal
-- [ ] Read-only shareable trip link (no Clerk account needed)
-- [ ] Token-based auth for client portal URLs
-- [ ] Client portal page: itinerary viewer (final version only)
-- [ ] PDF export option for clients
+### Weeks 19–20: Client Portal ✅
+- [x] `supabase/migrations/20260421000005_portal_tokens.sql` — portal_tokens table (token, trip_id, revoked, expires_at)
+- [x] `POST /trips/:id/portal/token` — Clerk-protected; generates 256-bit base64url token; returns { token, portalUrl }
+- [x] `GET /portal/:token` — public (no Clerk); validates token; returns trip metadata + latest itinerary markdown
+- [x] `GET /portal/:token/pdf` — public; generates PDF via puppeteer + marked; streams as attachment
+- [x] `apps/api/src/services/pdfGenerator.ts` — markdown → styled HTML → PDF via puppeteer headless Chromium
+- [x] `apps/api/src/routes/portal.ts` + `portal.test.ts` — 15 tests all passing
+- [x] `apps/web/src/pages/PortalPage.tsx` — public-facing itinerary viewer; react-markdown renderer; Download PDF button
+- [x] `/portal/:token` route in App.tsx outside Clerk auth guard
+- [x] `apiPublicFetch<T>()` exported from api.ts (no auth header)
+- [x] ShareButton component on TripPage — visible at review/complete status; generates token, shows copyable URL
+
+### Weeks 19–20 (continued): Booking Management + Vision Extraction ✅
+- [x] `DELETE /trips/:tripId/bookings/:bookingId` — ownership check, deletes booking row + associated R2 source document (best-effort)
+- [x] `DELETE /trips/:id` — ownership check; fetches all R2 keys (documents + itinerary versions); deletes trip row (FK cascades); best-effort R2 cleanup
+- [x] `POST /trips/:tripId/bookings/manual` — JSON body; validates booking_slug + booking_type; encrypts allergy_flags; returns 201 with new record
+- [x] Vision extraction in `ingest.worker.ts` — reads image as base64, calls Anthropic SDK directly with image content block (fast/Haiku tier), extracted text fed into normal parsing pipeline
+- [x] BookingsCard UI — delete button per row (× with confirm dialog), "Add manually" button opens ManualBookingModal
+- [x] ManualBookingModal — form for all booking fields (slug, type, ref, date, times, address, summary, meals/transport checkboxes)
+- [x] TripPage — "Delete trip" link in header with confirmation dialog; navigates to dashboard after deletion
+- [x] `apps/api/src/routes/bookings.test.ts` — NEW file; 10 tests covering DELETE booking, manual booking POST, and GET list (all passing)
+- [x] `apps/api/src/routes/trips.test.ts` — 2 new tests for DELETE trip; 143 total tests all passing
+
+### Weeks 19–20 (live debug + polish) ✅
+- [x] **Bug fix**: `apiFetch` and `apiStream` now only set `Content-Type: application/json` when a body is present — Fastify v5 rejects the header on bodyless POSTs. Fixed research/stream, document generation, and portal token creation.
+- [x] **Bug fix**: Manual booking insert removed non-existent `meeting_point` column (only `meeting_point_address` exists in schema). Was causing Supabase `PGRST204` schema cache error.
+- [x] **Bug fix**: `isFirstUpload` condition in `UploadSection` changed from `!trip.documents_ingested && trip.bookings.length === 0` to `!trip.documents_ingested` — manual bookings were preventing `documents_ingested` from ever being set `true`, blocking research.
+- [x] **Feature**: Research prompt updated to include `[Verify on Google]` search links per venue (search URL constructed from venue name + city — no hallucination risk). Prompt explicitly forbids direct website/Maps URLs.
+- [x] **Feature**: `ResearchPanel` switched from `<pre>` to `ReactMarkdown` with `@tailwindcss/typography` prose styles — venue links are now clickable, open in new tab.
 
 ### Weeks 21–22: Email Notifications
 - [ ] Email on: trip created, itinerary ready, document ready
@@ -199,13 +223,16 @@
 
 ## Immediate Next Actions (start of next session)
 
-**All Supabase migrations are up to date** — nothing to run before starting.
+**Supabase migrations to run before starting:**
+- `20260421000005_portal_tokens.sql` — portal_tokens table (**not yet run**)
 
-**Current test suite:** 114 tests across 6 files, all passing.  
+**Current test suite:** 143 tests across 8 files, all passing.  
 Run with: `pnpm --filter @trip-planner/api test`
 
-**Next task: Sprint 4 — Client Portal (Weeks 19–20)**
+**Known outstanding issue:** Delete trip button not confirmed working on pre-existing trips — test on a newly created trip before relying on it.
 
-1. **Read-only shareable trip link** — no Clerk account needed; token-based auth for client portal URLs
-2. **Client portal page** — itinerary viewer (final version only, read-only)
-3. **PDF export option** — for clients to download a PDF version of the itinerary
+**Next task: Sprint 4 — Email Notifications (Weeks 21–22)**
+
+1. **Transactional email provider** — integrate Resend or Postmark
+2. **Email triggers** — trip created, itinerary ready (draft generated), document ready
+3. **Unsubscribe handling** — one-click unsubscribe link in emails

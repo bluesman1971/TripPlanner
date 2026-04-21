@@ -6,6 +6,7 @@ import { DashboardPage } from './pages/DashboardPage';
 import { ClientsPage } from './pages/ClientsPage';
 import { NewTripPage } from './pages/NewTripPage';
 import { TripPage } from './pages/TripPage';
+import { PortalPage } from './pages/PortalPage';
 import { LoadingSpinner } from './components/ui/LoadingSpinner';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
 
@@ -24,6 +25,7 @@ export default function App() {
     <Routes>
       {/* Public */}
       <Route path="/sign-in/*" element={<SignInPage />} />
+      <Route path="/portal/:token" element={<PortalPage />} />
 
       {/* Protected — all inside the app shell */}
       <Route

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, useParams } from 'react-router-dom';
-import { useApi } from '../lib/api';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import ReactMarkdown from 'react-markdown';
+import { useApi, ApiError } from '../lib/api';
 import { ErrorMessage } from '../components/ui/ErrorMessage';
 import { TripPageSkeleton } from '../components/ui/Skeleton';
 
@@ -201,53 +202,317 @@ function TravelerProfileCard({ profile }: { profile: TravelerProfile }) {
   );
 }
 
-function BookingsCard({ bookings }: { bookings: Booking[] }) {
-  if (!bookings.length) {
-    return (
-      <Card title="Bookings">
-        <p className="text-sm text-gray-400 py-4 text-center">
-          No bookings ingested yet. Upload a confirmation document to get started.
-        </p>
-      </Card>
-    );
-  }
+// ─── Manual booking modal ─────────────────────────────────────────────────────
+
+const BOOKING_TYPES = ['tour', 'transfer', 'restaurant', 'accommodation', 'activity', 'flight', 'other'];
+
+interface ManualBookingForm {
+  booking_slug: string;
+  booking_type: string;
+  booking_ref: string;
+  date: string;
+  start_time: string;
+  end_time: string;
+  meeting_point_address: string;
+  summary: string;
+  included_meals: boolean;
+  included_transport: boolean;
+}
+
+function ManualBookingModal({
+  tripId,
+  onClose,
+  onSaved,
+}: {
+  tripId: string;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { apiFetch } = useApi();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [form, setForm] = useState<ManualBookingForm>({
+    booking_slug: '',
+    booking_type: 'tour',
+    booking_ref: '',
+    date: '',
+    start_time: '',
+    end_time: '',
+    meeting_point_address: '',
+    summary: '',
+    included_meals: false,
+    included_transport: false,
+  });
+
+  const set = (key: keyof ManualBookingForm, value: string | boolean) =>
+    setForm((f) => ({ ...f, [key]: value }));
+
+  const handleSave = async () => {
+    if (!form.booking_slug.trim()) {
+      setError('Booking name is required');
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await apiFetch(`/trips/${tripId}/bookings/manual`, {
+        method: 'POST',
+        body: JSON.stringify({
+          booking_slug: form.booking_slug.trim(),
+          booking_type: form.booking_type,
+          booking_ref: form.booking_ref.trim() || null,
+          date: form.date || null,
+          start_time: form.start_time || null,
+          end_time: form.end_time || null,
+          meeting_point_address: form.meeting_point_address.trim() || null,
+          summary: form.summary.trim() || null,
+          included_meals: form.included_meals,
+          included_transport: form.included_transport,
+        }),
+      });
+      onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save booking');
+      setSaving(false);
+    }
+  };
 
   return (
-    <Card title={`Bookings (${bookings.length})`}>
-      <div className="overflow-x-auto -mx-6 -my-5">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-gray-100 bg-gray-50">
-              <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-6 py-3 font-medium">Date</th>
-              <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium">Type</th>
-              <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium">Booking</th>
-              <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium">Time</th>
-              <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium pr-6">Meeting point</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {bookings.map((b) => (
-              <tr key={b.id} className="hover:bg-gray-50 transition-colors">
-                <td className="px-6 py-3 text-gray-700 whitespace-nowrap">{formatDate(b.date)}</td>
-                <td className="px-4 py-3">
-                  <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full capitalize">
-                    {b.booking_type}
-                  </span>
-                </td>
-                <td className="px-4 py-3 text-gray-700">{b.booking_slug}</td>
-                <td className="px-4 py-3 text-gray-600 whitespace-nowrap">
-                  {b.start_time ?? '—'}
-                  {b.end_time ? ` – ${b.end_time}` : ''}
-                </td>
-                <td className="px-4 py-3 pr-6 text-gray-500 text-xs max-w-xs truncate">
-                  {b.meeting_point_address ?? '—'}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Add booking manually</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-lg leading-none">×</button>
+        </div>
+        <div className="px-6 py-5 space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="col-span-2">
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Booking name *</label>
+              <input
+                type="text"
+                placeholder="e.g. sagrada-familia-tour"
+                value={form.booking_slug}
+                onChange={(e) => set('booking_slug', e.target.value)}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Type</label>
+              <select
+                value={form.booking_type}
+                onChange={(e) => set('booking_type', e.target.value)}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              >
+                {BOOKING_TYPES.map((t) => (
+                  <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Booking ref</label>
+              <input
+                type="text"
+                placeholder="e.g. ABC123"
+                value={form.booking_ref}
+                onChange={(e) => set('booking_ref', e.target.value)}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Date</label>
+              <input
+                type="date"
+                value={form.date}
+                onChange={(e) => set('date', e.target.value)}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Start time</label>
+              <input
+                type="time"
+                value={form.start_time}
+                onChange={(e) => set('start_time', e.target.value)}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">End time</label>
+              <input
+                type="time"
+                value={form.end_time}
+                onChange={(e) => set('end_time', e.target.value)}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Meeting point address</label>
+              <input
+                type="text"
+                placeholder="e.g. Carrer de Mallorca 401, Barcelona"
+                value={form.meeting_point_address}
+                onChange={(e) => set('meeting_point_address', e.target.value)}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400"
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Summary</label>
+              <textarea
+                placeholder="Brief description of what was booked"
+                value={form.summary}
+                onChange={(e) => set('summary', e.target.value)}
+                rows={2}
+                className="w-full text-sm border border-gray-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-slate-400 resize-none"
+              />
+            </div>
+            <div className="col-span-2 flex gap-6">
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.included_meals}
+                  onChange={(e) => set('included_meals', e.target.checked)}
+                  className="rounded"
+                />
+                Meals included
+              </label>
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.included_transport}
+                  onChange={(e) => set('included_transport', e.target.checked)}
+                  className="rounded"
+                />
+                Transport included
+              </label>
+            </div>
+          </div>
+
+          {error && <p className="text-sm text-red-600">{error}</p>}
+
+          <div className="flex items-center justify-end gap-3 pt-2">
+            <button
+              onClick={onClose}
+              className="text-sm text-gray-500 hover:text-gray-700 px-4 py-2"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="inline-flex items-center gap-2 bg-slate-900 text-white px-5 py-2 rounded-md text-sm font-medium hover:bg-slate-700 transition-colors disabled:opacity-50"
+            >
+              {saving ? 'Saving…' : 'Save booking'}
+            </button>
+          </div>
+        </div>
       </div>
-    </Card>
+    </div>
+  );
+}
+
+// ─── Bookings card ────────────────────────────────────────────────────────────
+
+function BookingsCard({
+  trip,
+  onBookingDeleted,
+}: {
+  trip: TripDetail;
+  onBookingDeleted: () => void;
+}) {
+  const { apiFetch } = useApi();
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [showManual, setShowManual] = useState(false);
+
+  const handleDelete = async (bookingId: string) => {
+    if (!confirm('Delete this booking? This cannot be undone.')) return;
+    setDeletingId(bookingId);
+    try {
+      await apiFetch(`/trips/${trip.id}/bookings/${bookingId}`, { method: 'DELETE' });
+      onBookingDeleted();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to delete booking');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const { bookings } = trip;
+
+  return (
+    <>
+      {showManual && (
+        <ManualBookingModal
+          tripId={trip.id}
+          onClose={() => setShowManual(false)}
+          onSaved={() => { setShowManual(false); onBookingDeleted(); }}
+        />
+      )}
+      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between gap-4">
+          <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">
+            {bookings.length > 0 ? `Bookings (${bookings.length})` : 'Bookings'}
+          </h2>
+          <button
+            onClick={() => setShowManual(true)}
+            className="text-xs px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md font-medium transition-colors"
+          >
+            + Add manually
+          </button>
+        </div>
+        {bookings.length === 0 ? (
+          <div className="px-6 py-5">
+            <p className="text-sm text-gray-400 py-4 text-center">
+              No bookings yet. Upload a confirmation document or add one manually.
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-100 bg-gray-50">
+                  <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-6 py-3 font-medium">Date</th>
+                  <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium">Type</th>
+                  <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium">Booking</th>
+                  <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium">Time</th>
+                  <th className="text-left text-xs text-gray-400 uppercase tracking-wide px-4 py-3 font-medium">Meeting point</th>
+                  <th className="px-4 py-3 w-8" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {bookings.map((b) => (
+                  <tr key={b.id} className="hover:bg-gray-50 transition-colors">
+                    <td className="px-6 py-3 text-gray-700 whitespace-nowrap">{formatDate(b.date)}</td>
+                    <td className="px-4 py-3">
+                      <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full capitalize">
+                        {b.booking_type}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-gray-700">{b.booking_slug}</td>
+                    <td className="px-4 py-3 text-gray-600 whitespace-nowrap">
+                      {b.start_time ?? '—'}
+                      {b.end_time ? ` – ${b.end_time}` : ''}
+                    </td>
+                    <td className="px-4 py-3 text-gray-500 text-xs max-w-xs truncate">
+                      {b.meeting_point_address ?? '—'}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <button
+                        onClick={() => handleDelete(b.id)}
+                        disabled={deletingId === b.id}
+                        title="Delete booking"
+                        className="text-gray-300 hover:text-red-500 transition-colors disabled:opacity-40 text-base leading-none"
+                      >
+                        {deletingId === b.id ? '…' : '×'}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -291,7 +556,7 @@ type UploadState =
   | { phase: 'uploading' }
   | { phase: 'polling'; jobId: string; progress: number; statusText: string; isFirstUpload: boolean }
   | { phase: 'done'; slug: string }
-  | { phase: 'error'; message: string };
+  | { phase: 'error'; message: string; isGuidance: boolean };
 
 interface JobPollResponse {
   status: string;
@@ -328,7 +593,7 @@ function UploadSection({ trip }: { trip: TripDetail }) {
           queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
           setState({ phase: 'done', slug: res.result?.bookingSlug ?? 'booking' });
         } else if (res.status === 'failed') {
-          setState({ phase: 'error', message: res.error ?? 'Ingestion failed' });
+          setState({ phase: 'error', message: res.error ?? 'Ingestion failed', isGuidance: false });
         } else {
           // Still in progress — update progress and loop
           setState({
@@ -340,7 +605,7 @@ function UploadSection({ trip }: { trip: TripDetail }) {
           });
         }
       } catch {
-        setState({ phase: 'error', message: 'Lost connection while polling. Check the bookings list — it may have succeeded.' });
+        setState({ phase: 'error', message: 'Lost connection while polling. Check the bookings list — it may have succeeded.', isGuidance: false });
       }
     }, 2000);
 
@@ -354,7 +619,7 @@ function UploadSection({ trip }: { trip: TripDetail }) {
       // Reset input so the same file can be re-uploaded if needed
       e.target.value = '';
 
-      const isFirstUpload = !trip.documents_ingested && trip.bookings.length === 0;
+      const isFirstUpload = !trip.documents_ingested;
 
       setState({ phase: 'uploading' });
       try {
@@ -367,7 +632,8 @@ function UploadSection({ trip }: { trip: TripDetail }) {
         setState({ phase: 'polling', jobId: res.jobId, progress: 0, statusText: 'waiting', isFirstUpload });
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Upload failed';
-        setState({ phase: 'error', message: msg });
+        const isGuidance = err instanceof ApiError && err.status === 422;
+        setState({ phase: 'error', message: msg, isGuidance });
       }
     },
     [trip, apiUpload],
@@ -427,13 +693,20 @@ function UploadSection({ trip }: { trip: TripDetail }) {
         </p>
       )}
 
-      {/* Error */}
+      {/* Error / guidance */}
       {state.phase === 'error' && (
-        <div className="mt-3 flex items-start justify-between gap-3">
-          <p className="text-sm text-red-600">{state.message}</p>
+        <div className={`mt-3 rounded-md px-4 py-3 flex items-start justify-between gap-3 ${
+          state.isGuidance
+            ? 'bg-amber-50 border border-amber-200'
+            : 'bg-red-50 border border-red-200'
+        }`}>
+          <p className={`text-sm ${state.isGuidance ? 'text-amber-800' : 'text-red-700'}`}>
+            {state.isGuidance && <span className="font-medium">Can't read this file. </span>}
+            {state.message}
+          </p>
           <button
             onClick={() => setState({ phase: 'idle' })}
-            className="text-xs text-gray-400 hover:text-gray-600 shrink-0 underline"
+            className="text-xs text-gray-400 hover:text-gray-600 shrink-0 underline mt-0.5"
           >
             Dismiss
           </button>
@@ -506,9 +779,19 @@ function ResearchPanel({ trip }: { trip: TripDetail }) {
   if (displayContent && state.phase === 'idle') {
     return (
       <Card title="Research">
-        <pre className="text-sm text-gray-700 whitespace-pre-wrap font-sans leading-relaxed">
-          {displayContent}
-        </pre>
+        <div className="prose prose-sm prose-slate max-w-none">
+          <ReactMarkdown
+            components={{
+              a: ({ href, children }) => (
+                <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                  {children}
+                </a>
+              ),
+            }}
+          >
+            {displayContent}
+          </ReactMarkdown>
+        </div>
       </Card>
     );
   }
@@ -552,12 +835,22 @@ function ResearchPanel({ trip }: { trip: TripDetail }) {
         )}
 
         {(state.phase === 'streaming' || state.phase === 'done') && (
-          <pre className="text-sm text-gray-700 whitespace-pre-wrap font-sans leading-relaxed">
-            {state.content}
+          <div className="prose prose-sm prose-slate max-w-none">
+            <ReactMarkdown
+              components={{
+                a: ({ href, children }) => (
+                  <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                    {children}
+                  </a>
+                ),
+              }}
+            >
+              {state.content}
+            </ReactMarkdown>
             {state.phase === 'streaming' && (
               <span className="inline-block w-1.5 h-4 bg-slate-400 animate-pulse ml-0.5 align-text-bottom" />
             )}
-          </pre>
+          </div>
         )}
 
         {state.phase === 'error' && (
@@ -1025,17 +1318,113 @@ function DocumentPanel({ trip }: { trip: TripDetail }) {
   );
 }
 
+// ─── Share button ─────────────────────────────────────────────────────────────
+
+type ShareState =
+  | { phase: 'idle' }
+  | { phase: 'loading' }
+  | { phase: 'done'; portalUrl: string; copied: boolean }
+  | { phase: 'error'; message: string };
+
+function ShareButton({ tripId }: { tripId: string }) {
+  const { apiFetch } = useApi();
+  const [state, setState] = useState<ShareState>({ phase: 'idle' });
+
+  const handleShare = async () => {
+    setState({ phase: 'loading' });
+    try {
+      const res = await apiFetch<{ token: string; portalUrl: string }>(
+        `/trips/${tripId}/portal/token`,
+        { method: 'POST' },
+      );
+      setState({ phase: 'done', portalUrl: res.portalUrl, copied: false });
+    } catch (err) {
+      setState({ phase: 'error', message: err instanceof Error ? err.message : 'Failed to create share link.' });
+    }
+  };
+
+  const handleCopy = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setState((s) => s.phase === 'done' ? { ...s, copied: true } : s);
+      setTimeout(() => setState((s) => s.phase === 'done' ? { ...s, copied: false } : s), 2000);
+    } catch {
+      // Clipboard API unavailable — select the input text as fallback
+    }
+  };
+
+  if (state.phase === 'idle' || state.phase === 'loading' || state.phase === 'error') {
+    return (
+      <div className="flex flex-col items-end gap-1">
+        <button
+          onClick={handleShare}
+          disabled={state.phase === 'loading'}
+          className="inline-flex items-center gap-2 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-gray-700 text-sm font-medium rounded-lg transition-colors"
+        >
+          {state.phase === 'loading' ? 'Generating…' : 'Share with client'}
+        </button>
+        {state.phase === 'error' && (
+          <p className="text-xs text-red-500">{state.message}</p>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1.5">
+      <p className="text-xs text-gray-400">Client portal link</p>
+      <div className="flex items-center gap-2">
+        <input
+          readOnly
+          value={state.portalUrl}
+          className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1 w-64 truncate"
+          onFocus={(e) => e.target.select()}
+        />
+        <button
+          onClick={() => handleCopy(state.portalUrl)}
+          className="text-xs px-2 py-1 bg-gray-900 hover:bg-gray-700 text-white rounded transition-colors"
+        >
+          {state.copied ? 'Copied!' : 'Copy'}
+        </button>
+      </div>
+      <button
+        onClick={() => setState({ phase: 'idle' })}
+        className="text-xs text-gray-400 hover:text-gray-600"
+      >
+        Generate another
+      </button>
+    </div>
+  );
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export function TripPage() {
   const { id } = useParams<{ id: string }>();
   const { apiFetch } = useApi();
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const [deletingTrip, setDeletingTrip] = useState(false);
 
   const { data: trip, isLoading, error } = useQuery({
     queryKey: ['trip', id],
     queryFn: () => apiFetch<TripDetail>(`/trips/${id}`),
     enabled: !!id,
   });
+
+  const handleDeleteTrip = async () => {
+    if (!trip) return;
+    if (!confirm(`Delete "${trip.destination}"? This will permanently remove all bookings, research, and itinerary versions. This cannot be undone.`)) return;
+    setDeletingTrip(true);
+    try {
+      await apiFetch(`/trips/${trip.id}`, { method: 'DELETE' });
+      queryClient.invalidateQueries({ queryKey: ['trips'] });
+      navigate('/');
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to delete trip');
+      setDeletingTrip(false);
+    }
+  };
 
   if (isLoading) return <TripPageSkeleton />;
   if (error)     return <ErrorMessage message="Could not load trip. Make sure the API server is running." />;
@@ -1063,7 +1452,22 @@ export function TripPage() {
               )}
             </p>
           </div>
-          <StatusBadge status={trip.status} />
+          <div className="flex flex-col items-end gap-3">
+            <div className="flex items-center gap-3">
+              <StatusBadge status={trip.status} />
+              <button
+                onClick={handleDeleteTrip}
+                disabled={deletingTrip}
+                title="Delete trip"
+                className="text-xs text-gray-300 hover:text-red-500 transition-colors disabled:opacity-40 font-medium"
+              >
+                {deletingTrip ? 'Deleting…' : 'Delete trip'}
+              </button>
+            </div>
+            {(trip.status === 'review' || trip.status === 'complete') && (
+              <ShareButton tripId={trip.id} />
+            )}
+          </div>
         </div>
 
         <div className="mt-4 flex flex-wrap gap-6 text-sm">
@@ -1110,7 +1514,10 @@ export function TripPage() {
           <UploadSection trip={trip} />
         )}
 
-        <BookingsCard bookings={trip.bookings} />
+        <BookingsCard
+          trip={trip}
+          onBookingDeleted={() => queryClient.invalidateQueries({ queryKey: ['trip', trip.id] })}
+        />
 
         <ResearchPanel trip={trip} />
 

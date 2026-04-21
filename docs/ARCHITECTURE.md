@@ -1,7 +1,7 @@
 # TripPlanner — Architecture Reference
 
 > Last updated: 2026-04-21  
-> Build status: Sprint 3, Weeks 17–18 complete (AI Integration sprint done)  
+> Build status: Sprint 4, Weeks 19–20 complete (Client Portal + Booking Management + Live Debug session done)  
 > Prototype validated on Barcelona trip (April 19 2026)
 
 ---
@@ -66,7 +66,7 @@ SUPABASE_URL=https://xxx.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=eyJ...
 
 # Cloudflare R2
-R2_ACCOUNT_ID=...
+CLOUDFLARE_ACCOUNT_ID=...   # used by r2.ts — NOT R2_ACCOUNT_ID
 R2_ACCESS_KEY_ID=...
 R2_SECRET_ACCESS_KEY=...
 R2_BUCKET_NAME=trip-planner-bookings
@@ -232,6 +232,17 @@ size_bytes  int
 uploaded_at timestamptz
 ```
 
+**`portal_tokens`**
+```
+id         uuid PK
+trip_id    uuid FK → trips.id (ON DELETE CASCADE)
+token      text UNIQUE NOT NULL   ← 256-bit base64url random token
+created_at timestamptz
+expires_at timestamptz nullable   ← null = never expires
+revoked    boolean default false
+```
+Token auth: `GET /portal/:token` and `GET /portal/:token/pdf` are public routes. Token validity = exists AND revoked=false AND (expires_at IS NULL OR expires_at > now()).
+
 **`research_notes`**
 ```
 id         uuid PK
@@ -254,6 +265,7 @@ to `content` to match application code.
 | `20260420000002_clients_contact_fields.sql` | Add phone, address_line, city, country, postal_code to clients | ✅ Run |
 | `20260420000003_research_notes_rename_column.sql` | Rename `content_markdown` → `content` in research_notes | ✅ Run |
 | `20260420000004_itinerary_versions_token_columns.sql` | Add input_tokens, output_tokens, model_used to itinerary_versions | ✅ Run |
+| `20260421000005_portal_tokens.sql` | portal_tokens table for shareable client links | ⏳ Pending |
 
 ---
 
@@ -326,6 +338,43 @@ Generates DOCX from latest `itinerary_versions.markdown_content` via `docxGenera
 Uploads to R2 at `itineraries/{tripId}/{uuid}.docx`. Saves `docx_r2_key` on the version row. Advances status → `review`.  
 Download endpoint is an authenticated proxy — no presigned URLs, requires Clerk JWT.  
 Google Maps day maps require `GOOGLE_MAPS_API_KEY` in `.env`; silently skipped if absent.
+
+### Client Portal — Weeks 19–20
+```
+POST /trips/:id/portal/token        → { token, portalUrl }  (201; requires Clerk JWT)
+GET  /portal/:token                 → { trip, itinerary }   (public — token-based auth)
+GET  /portal/:token/pdf             → PDF binary             (public — token-based auth)
+```
+
+Token creation: consultant-only; verifies trip ownership. Returns a 256-bit base64url token and the full frontend portal URL.  
+Public endpoints: no Clerk JWT. Token validated on every request. Invalid/revoked/expired → 404 (never 403, to prevent enumeration).  
+PDF: markdown rendered to styled HTML via `marked`, then printed to PDF via puppeteer headless Chromium.  
+`FRONTEND_URL` env var controls the portal URL prefix (falls back to `CORS_ORIGIN`).
+
+### Booking Management — Weeks 19–20 (continued)
+```
+DELETE /trips/:tripId/bookings/:bookingId  → 204  (requires Clerk JWT)
+POST   /trips/:tripId/bookings/manual      → 201 booking record  (requires Clerk JWT)
+DELETE /trips/:id                          → 204  (requires Clerk JWT)
+```
+
+**DELETE booking**: Verifies trip ownership. Fetches the most recent `documents` row for R2 key. Deletes booking DB row; best-effort R2 file cleanup (failure logged, not propagated).  
+**Manual booking**: JSON body; requires `booking_slug` (string) and `booking_type` (one of the 7 allowed types). All other fields optional. `allergy_flags` encrypted before insert. Returns 201 with the new booking row.  
+**DELETE trip**: Verifies ownership; gathers all R2 keys from `documents` + `itinerary_versions`; deletes trip row (FK cascade handles bookings, briefs, research_notes, portal_tokens, itinerary_versions); then best-effort `Promise.allSettled()` R2 cleanup.
+
+**Vision extraction** (`ingest.worker.ts`): Image files bypass text extraction. The image is read as base64 from the temp file; the Anthropic SDK is called directly (not through the shared `AIProvider` abstraction — the shared `Message` type only accepts `content: string`, not multipart arrays). Uses the `fast/Haiku` model. The extracted text is then passed to the normal `parseBookingDocument()` pipeline.
+
+**Frontend changes**:
+- `BookingsCard` — now receives the full `trip` object and an `onBookingDeleted` callback. Each row has a `×` delete button (confirm dialog, optimistic invalidation). "Add manually" button opens `ManualBookingModal`.
+- `ManualBookingModal` — full-screen modal form covering all booking fields.
+- `TripPage` — "Delete trip" link in the trip header; calls `DELETE /trips/:id`, invalidates `['trips']` query, navigates to `/`.
+
+### Research Venue Verification — Live Debug Session
+No API or DB changes. Two updates only:
+
+**`researchPrompt.ts`**: System prompt updated to instruct Claude to append a `[Verify on Google](https://www.google.com/search?q=Venue+Name+City+Country)` link after every venue name in the CANDIDATE VENUES section. Claude constructs the URL from the venue name and destination city it already knows — spaces replaced by `+`. Explicit instruction: do NOT produce direct website or Maps URLs (hallucination risk); only this search pattern.
+
+**`TripPage.tsx` ResearchPanel**: Switched from `<pre>` plain-text rendering to `ReactMarkdown` with `@tailwindcss/typography` prose styles. External links open in a new tab (`target="_blank" rel="noopener noreferrer"`). Applies to both the idle (saved note) view and the streaming view. Required installing `@tailwindcss/typography` and adding `@plugin "@tailwindcss/typography"` to `index.css`.
 
 ### Revision (Phase 7) — Week 16
 ```
@@ -450,6 +499,7 @@ apps/web/src/
     ├── DashboardPage.tsx  — Trip list; client filter via ?client= URL param
     ├── ClientsPage.tsx    — Client list, create/edit modal
     ├── NewTripPage.tsx    — 5-step trip creation wizard
+    ├── PortalPage.tsx     — Public client portal (no Clerk auth); fetches via apiPublicFetch
     └── TripPage.tsx       — Trip workspace; contains:
                               UploadSection        — file upload + job polling
                               ResearchPanel        — stream/display research (Phase 3)
@@ -467,6 +517,9 @@ apps/web/src/
 | `apiUpload<T>(path, formData)` | Multipart upload with Clerk JWT |
 | `apiStream(path, onChunk, options?)` | SSE fetch; calls `onChunk` per text chunk |
 | `apiDownload(path, filename)` | Binary fetch → triggers browser download |
+| `apiPublicFetch<T>(path)` | JSON fetch **without** Clerk JWT — for portal endpoints |
+
+`apiPublicFetch` is a named export (not inside `useApi()`) since the portal page has no Clerk context.
 
 `apiStream` uses `fetch()` + `ReadableStream.getReader()` (not `EventSource`) because `EventSource` cannot send custom headers (Clerk JWT required).
 
@@ -487,7 +540,7 @@ apps/web/src/
 | CORS mismatch | CORS_ORIGIN must match actual Vite dev port (currently 5174) |
 | BullMQ + Upstash | `maxRetriesPerRequest: null`, `enableReadyCheck: false`, `tls: {}` when URL starts with `rediss://` |
 | Mammoth ships its own types | Do not install `@types/mammoth` — it doesn't exist on npm |
-| pdf-parse v2 import | Use `const pdfMod = require('pdf-parse') as any; const pdfParse = typeof pdfMod === 'function' ? pdfMod : (pdfMod.default ?? pdfMod)` |
+| pdf-parse version | Pinned to **v1.1.1** in package.json. v2 (by a different author) exports a class, not a function — incompatible API. Do not upgrade. Import: `const pdfParse = require('pdf-parse') as (buf: Buffer) => Promise<{ text: string }>` |
 | tsconfig rootDir | Do not set `rootDir: src` in apps/api — it blocks access to packages/shared |
 | Google Docs DOCX | Use `WidthType.DXA` not `WidthType.PERCENTAGE`; `ShadingType.CLEAR` not `ShadingType.SOLID` |
 | Itinerary versions | Never overwrite — always write v[N+1] |
@@ -500,6 +553,15 @@ apps/web/src/
 | Context budget heuristic | `estimateTokens` uses 4 chars/token. This is a rough estimate — actual token count varies by language and encoding. Good enough for budget gating; do not use for billing |
 | setInterval + hijacked SSE | The ping interval MUST be cleared in `finally { stopPing(); }` — if not cleared, it may fire after `reply.raw.end()` and write to a closed stream |
 | vi.clearAllMocks() | All test files that assert on mock call counts must call `vi.clearAllMocks()` at the top of `beforeEach`. Omitting it causes call counts to accumulate across tests |
+| R2 account ID env var | Code reads `CLOUDFLARE_ACCOUNT_ID` — **not** `R2_ACCOUNT_ID`. Docs previously had the wrong name. Wrong/missing value causes a silent hang on file upload (AWS SDK has no default timeout). |
+| Portal token enumeration | Public portal endpoints return 404 (not 403) for invalid/revoked/expired tokens to prevent confirming that a token exists |
+| puppeteer on Windows | `--no-sandbox` flag required in `puppeteer.launch()` args; puppeteer downloads Chromium on first `pnpm install` (~200 MB) |
+| FRONTEND_URL env var | Optional; controls the portal URL prefix in `POST /trips/:id/portal/token` response. Falls back to `CORS_ORIGIN`. Add to `apps/api/.env` when deploying. |
+| Fastify v5 empty JSON body | Fastify v5 rejects any request with `Content-Type: application/json` and an empty body (`FST_ERR_CTP_EMPTY_JSON_BODY`). `apiFetch` and `apiStream` in `api.ts` must NOT set `Content-Type: application/json` on bodyless POSTs. Fixed: header is now conditional on `options.body` being present. Affected: research/stream, portal/token, document generation. |
+| `meeting_point` vs `meeting_point_address` | The `bookings` table has `meeting_point_address` only — there is no separate `meeting_point` column. The manual booking insert previously included `meeting_point` which caused a Supabase schema cache error. Removed. |
+| Venue URL hallucination | Do NOT ask Claude to produce direct website or Google Maps place URLs — it will hallucinate plausible-looking but incorrect links. Instead, instruct it to construct Google search URLs from venue name + city (`https://www.google.com/search?q=Venue+Name+City`). These are always correct because Claude builds them from text it already wrote. |
+| @tailwindcss/typography | Required for `prose` classes used in ResearchPanel markdown rendering. Install with `pnpm add @tailwindcss/typography` in `apps/web`, then add `@plugin "@tailwindcss/typography";` to `apps/web/src/index.css`. Tailwind v4 plugin syntax — not the v3 `plugins: [require(...)]` approach. |
+| `isFirstUpload` gate | The `UploadSection` condition was `!trip.documents_ingested && trip.bookings.length === 0`. The `bookings.length` check blocked the `documentsIngested: true` PATCH when manual bookings existed, leaving `documents_ingested` permanently `false` and blocking research. Fixed to `!trip.documents_ingested` only. |
 
 ---
 
@@ -522,7 +584,7 @@ Critical values that must not drift:
 pnpm dev                              # starts api + web concurrently via Turborepo
 pnpm --filter @trip-planner/api dev   # API only (port 3000)
 pnpm --filter @trip-planner/web dev   # Web only (port 5174)
-pnpm --filter @trip-planner/api test  # Vitest (114 tests across 6 files — all passing)
+pnpm --filter @trip-planner/api test  # Vitest (129 tests across 7 files — all passing)
 pnpm --filter @trip-planner/api typecheck
 pnpm --filter @trip-planner/web typecheck
 ```
@@ -545,6 +607,7 @@ apps/api/src/
 │   ├── draft.ts    + draft.test.ts      — Phase 5 SSE stream + GET   (26 tests)
 │   ├── document.ts + document.test.ts   — Phase 6 POST/GET/download  (28 tests)
 │   ├── revise.ts   + revise.test.ts     — Phase 7 SSE stream         (25 tests)
+│   ├── portal.ts   + portal.test.ts     — Client portal              (15 tests)
 │   ├── trips.ts    + trips.test.ts      — CRUD                        (4 tests)
 │   ├── clients.ts
 │   └── bookings.ts

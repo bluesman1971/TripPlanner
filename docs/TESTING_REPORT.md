@@ -1,8 +1,8 @@
 # TripPlanner — API Testing Report
 
-> Sprint 3 (Weeks 13–18) | Prepared: 2026-04-21  
+> Updated: Sprint 4 (Weeks 19–20, continued) | Prepared: 2026-04-21  
 > Reviewed by: Claude Code (Anthropic) on behalf of Tom Baker  
-> Status: **114 tests, all passing**
+> Status: **143 tests, all passing**
 
 ---
 
@@ -23,11 +23,13 @@ Tests cover three new route modules, each representing an AI pipeline phase:
 | `draft.ts` | Phase 5 — Itinerary draft | 26 |
 | `document.ts` | Phase 6 — Document generation | 28 |
 | `revise.ts` | Phase 7 — Itinerary revision | 25 |
-| `trips.ts` | Core CRUD (pre-existing) | 4 |
+| `portal.ts` | Client Portal — token + view + PDF | 15 |
+| `trips.ts` | Core CRUD + DELETE trip | 6 |
+| `bookings.ts` | Booking CRUD (delete, manual, list) | 10 |
 | `contextManager.ts` | Context budget utilities | 13 |
-| **Total** | | **114** |
+| **Total** | | **143** |
 
-> Route counts include new tests from Weeks 17–18 (usage logging, resume path). The contextManager unit tests are in `services/contextManager.test.ts`.
+> Route counts include new tests from Weeks 17–18 (usage logging, resume path), Weeks 19–20 (portal), and the continued Weeks 19–20 session (booking management). The contextManager unit tests are in `services/contextManager.test.ts`.
 
 ---
 
@@ -407,26 +409,99 @@ Three failures were encountered and resolved during this sprint. All are documen
 | `apps/api/src/routes/draft.test.ts` | Draft phase | 26 |
 | `apps/api/src/routes/document.test.ts` | Document generation | 28 |
 | `apps/api/src/routes/revise.test.ts` | Revision phase | 25 |
+| `apps/api/src/routes/portal.test.ts` | Client portal | 15 |
 | `apps/api/src/services/contextManager.test.ts` | Context manager utilities | 13 |
 
 Run all: `pnpm --filter @trip-planner/api test`
 
 ---
 
-## 12. Summary
+## 12. Weeks 19–20 New Tests (Client Portal)
+
+### Portal route tests (`portal.test.ts`)
+
+| Test | What it verifies |
+|---|---|
+| `POST /trips/:id/portal/token` — 401 unauthenticated | Clerk auth required to create tokens |
+| `POST` — 404 for another consultant's trip | IDOR: ownership check prevents cross-tenant token creation |
+| `POST` — 404 for non-existent trip | Non-existent trip returns 404 |
+| `POST` — 201 with token and portalUrl | Token returned; portalUrl contains the token |
+| `POST` — inserts token with correct trip_id | DB side-effect verified |
+| `GET /portal/:token` — 404 for unknown token | Invalid token → 404 (not 403, to avoid enumeration) |
+| `GET /portal/:token` — 404 for revoked token | Revoked token → 404 |
+| `GET /portal/:token` — 404 for expired token | `expires_at` in the past → 404 |
+| `GET /portal/:token` — 200 with trip + itinerary | Full response shape verified |
+| `GET /portal/:token` — 404 when no itinerary exists | Trip with no versions returns 404 |
+| `GET /portal/:token/pdf` — 200 with correct content-type | `application/pdf` |
+| `GET /portal/:token/pdf` — attachment content-disposition | Filename includes `.pdf` |
+| `GET /portal/:token/pdf` — calls generatePdf with markdown | Correct content passed to generator |
+| `GET /portal/:token/pdf` — 500 on generator failure | Generic message; internal error not leaked |
+| `GET /portal/:token/pdf` — 404 for unknown token | Token validated before PDF generation |
+
+**Mock design:** `generatePdf` is mocked (returns `Buffer.from('%PDF-mock-content')`) — isolates the route from puppeteer. The Supabase mock handles `portal_tokens` table lookups with revocation and expiry logic. `vi.clearAllMocks()` in `beforeEach` per established pattern.
+
+**Security note on token enumeration:** All invalid token states (unknown, revoked, expired) return 404. Returning 403 for revoked/expired would confirm that the token once existed — information that should not be disclosed.
+
+---
+
+## 13. Weeks 19–20 (continued) New Tests (Booking Management)
+
+### Trips route tests — DELETE trip (`trips.test.ts`, 2 new tests)
+
+| Test | What it verifies |
+|---|---|
+| `DELETE /trips/:id` — 404 when trip belongs to another consultant (IDOR) | Ownership check prevents cross-tenant deletion |
+| `DELETE /trips/:id` — 204, trip deleted | Trip row removed; `deletedTripIds` side-effect verified |
+
+### Bookings route tests (`bookings.test.ts`, 10 tests — new file)
+
+| Test | What it verifies |
+|---|---|
+| `DELETE /trips/:tripId/bookings/:bookingId` — 401 unauthenticated | Clerk auth required |
+| `DELETE` — 404 when trip belongs to another consultant (IDOR) | Ownership check on trip before touching bookings |
+| `DELETE` — 404 when booking does not exist | Booking not found in this trip |
+| `DELETE` — 204, booking deleted | Booking row removed; R2 cleanup attempted |
+| `POST /trips/:tripId/bookings/manual` — 401 unauthenticated | Clerk auth required |
+| `POST` — 404 when trip belongs to another consultant (IDOR) | Ownership check |
+| `POST` — 400 when booking_slug is missing | Required field validation |
+| `POST` — 400 when booking_type is invalid | Enum validation (7 allowed types) |
+| `POST` — 201 with new booking record | Happy path; `insertedBookings` side-effect verified |
+| `GET /trips/:tripId/bookings` — 401, 404 (IDOR), 200 | Auth + ownership + list |
+
+**Mock design:** Separate `bookings.test.ts` with full in-memory mock for `bookings`, `documents`, `trips`, and `consultants` tables. R2 mocked (`deleteFromR2` → no-op). Encryption mocked (identity transforms with `enc:` prefix). `vi.clearAllMocks()` in `beforeEach`.
+
+---
+
+## 14. Live Debug Session — Bugs Found in Manual Testing
+
+No new automated tests added in this session (bugs were in frontend logic and prompt content, not API route logic). All 143 tests continue to pass.
+
+| Bug | Root cause | Fix |
+|---|---|---|
+| Research stream → 400 Bad Request | `apiStream` always set `Content-Type: application/json` even when no body sent; Fastify v5 rejects empty JSON body (`FST_ERR_CTP_EMPTY_JSON_BODY`) | Made `Content-Type` conditional on `options.body` being present in both `apiFetch` and `apiStream` |
+| Manual booking insert → 500 (`PGRST204`) | Insert included `meeting_point` field which does not exist in the `bookings` schema (only `meeting_point_address` exists) | Removed `meeting_point` from the insert payload in `bookings.ts` |
+| Document generation → 400 Bad Request | Same empty-body `Content-Type` issue — `apiFetch({ method: 'POST' })` with no body | Same fix as research stream (same root cause, same code path) |
+| Research gate → always 400 after adding manual bookings | `isFirstUpload` checked `trip.bookings.length === 0` — manual bookings set length > 0 so `documentsIngested: true` PATCH never fired | Changed condition to `!trip.documents_ingested` only |
+
+**Pattern:** Fastify v5 is stricter than v4 about `Content-Type: application/json` with empty bodies. Any future bodyless POST must not set this header. The fix is in `apps/web/src/lib/api.ts` — applies globally to all `apiFetch` and `apiStream` calls.
+
+---
+
+## 15. Summary
 
 | Category | Count | Pass |
 |---|---|---|
-| Auth (401) tests | 7 | ✅ 7/7 |
-| IDOR prevention tests | 10 | ✅ 10/10 |
-| Gate / precondition tests | 8 | ✅ 8/8 |
-| Happy-path functional tests | 26 | ✅ 26/26 |
-| AI provider failure tests | 10 | ✅ 10/10 |
+| Auth (401) tests | 11 | ✅ 11/11 |
+| IDOR prevention tests | 16 | ✅ 16/16 |
+| Token validation tests (portal) | 3 | ✅ 3/3 |
+| Gate / precondition tests | 10 | ✅ 10/10 |
+| Happy-path functional tests | 33 | ✅ 33/33 |
+| AI provider / PDF failure tests | 11 | ✅ 11/11 |
 | Usage logging tests | 3 | ✅ 3/3 |
 | Resume path tests | 3 | ✅ 3/3 |
 | Context manager unit tests | 13 | ✅ 13/13 |
-| Other (headers, content-type, versioning) | 34 | ✅ 34/34 |
-| **Total** | **114** | **✅ 114/114** |
+| Other (headers, content-type, versioning, side-effects, validation) | 40 | ✅ 40/40 |
+| **Total** | **143** | **✅ 143/143** |
 
-Failures during development: **6** — all resolved before merge. 3 from Weeks 13–16 (documented in section 8); 3 from Weeks 17–18 (mock call-count isolation — `vi.clearAllMocks()` added to research.test.ts and draft.test.ts `beforeEach`).  
+Failures during development: **6 total** — all resolved before merge. 3 from Weeks 13–16 (documented in section 8); 3 from Weeks 17–18 (mock call-count isolation). Weeks 19–20 (portal): zero failures on first run. Weeks 19–20 (booking management): zero failures on first run.  
 Critical production bug found: **1** — `research_notes` column name mismatch (section 9, first item). Resolved.

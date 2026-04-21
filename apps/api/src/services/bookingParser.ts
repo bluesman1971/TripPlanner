@@ -66,18 +66,23 @@ export async function parseBookingDocument(rawText: string): Promise<ParsedBooki
           content: `Parse this booking confirmation:\n\n${rawText}`,
         },
       ],
-      maxTokens: 1024,
+      maxTokens: 4096,
     },
     { model: cfg.model, temperature: 0 },
   );
 
-  const raw = output.content.trim();
+  // Extract the JSON object from the response, ignoring any code fences or prose the model adds
+  const raw = output.content;
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error(`AI returned no JSON object: ${raw.slice(0, 200)}`);
+  }
 
   let parsed: ParsedBooking;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(jsonMatch[0]);
   } catch {
-    throw new Error(`AI returned invalid JSON: ${raw.slice(0, 200)}`);
+    throw new Error(`AI returned invalid JSON: ${jsonMatch[0].slice(0, 200)}`);
   }
 
   // Ensure required fields have safe defaults
