@@ -3,6 +3,7 @@ import { useAuth } from '@clerk/react';
 import { AppShell } from './components/layout/AppShell';
 import { SignInPage } from './pages/SignInPage';
 import { DashboardPage } from './pages/DashboardPage';
+import { ClientsPage } from './pages/ClientsPage';
 import { LoadingSpinner } from './components/ui/LoadingSpinner';
 
 /** Wraps routes that require authentication. */
@@ -32,7 +33,7 @@ export default function App() {
         <Route index element={<DashboardPage />} />
         <Route path="trips/:id" element={<div className="text-gray-500">Trip detail — coming soon</div>} />
         <Route path="trips/new"  element={<div className="text-gray-500">New trip wizard — coming soon</div>} />
-        <Route path="clients"    element={<div className="text-gray-500">Clients — coming soon</div>} />
+        <Route path="clients"    element={<ClientsPage />} />
       </Route>
 
       {/* Fallback */}
