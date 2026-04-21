@@ -1,5 +1,8 @@
 import 'dotenv/config';
+import { validateEnv } from './lib/validateEnv';
 import { buildApp } from './app';
+
+validateEnv();
 import { startIngestWorker } from './workers/ingest.worker';
 import { startDocumentWorker } from './workers/document.worker';
 
