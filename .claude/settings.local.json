@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --filter @trip-planner/api add puppeteer marked)",
+      "Bash(pnpm --filter @trip-planner/web add react-markdown)",
+      "Bash(pnpm --filter @trip-planner/api test)",
+      "Bash(pnpm --filter @trip-planner/api typecheck)",
+      "Bash(pnpm --filter @trip-planner/web typecheck)",
+      "Bash(node -e \"const m = require\\('C:/Users/tdbak/ClaudeWork2/TripPlanner/apps/api/node_modules/pdf-parse/index.js'\\); console.log\\(typeof m\\); console.log\\(Object.keys\\(m\\)\\);\")",
+      "Bash(node -e \"const m = require\\('pdf-parse'\\); console.log\\(typeof m\\); console.log\\(Object.keys\\(m\\)\\);\")",
+      "Bash(node -e \"const m = require\\('./node_modules/.pnpm/pdf-parse@2.4.5/node_modules/pdf-parse/dist/pdf-parse/cjs/index.cjs'\\); console.log\\(typeof m\\); console.log\\(Object.keys\\(m\\).slice\\(0,10\\)\\);\")",
+      "Bash(pnpm --filter @trip-planner/api add pdf-parse@1.1.1)",
+      "Bash(node -e ' *)",
+      "Bash(npx vitest *)",
+      "Bash(npx tsc *)",
+      "Bash(pnpm add *)",
+      "Bash(pnpm --filter @trip-planner/api test --run)",
+      "Bash(pnpm --filter @trip-planner/api lint)",
+      "Bash(pnpm --filter @trip-planner/api add resend)",
+      "Bash(pnpm audit *)",
+      "Bash(pnpm --filter @trip-planner/api add -D vitest@latest)",
+      "Bash(pnpm --filter @trip-planner/api add -D vitest@2)",
+      "Bash(npm list *)",
+      "Bash(find /c/Users/tdbak/ClaudeWork2/TripPlanner -name \"tsconfig.json\" -exec grep -l \"strict\" {} \\\\;)",
+      "Bash(xargs wc *)",
+      "Bash(pnpm --filter @trip-planner/api test --reporter=verbose)"
+    ]
+  }
+}

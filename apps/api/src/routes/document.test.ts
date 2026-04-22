@@ -305,7 +305,8 @@ describe('document routes', () => {
   it('POST /document enqueues job with correct tripId, versionId, and markdown', async () => {
     await app.inject({ method: 'POST', url: `/trips/${TRIP_ID}/document` });
     expect(mockQueueAdd).toHaveBeenCalledOnce();
-    const [, jobData] = mockQueueAdd.mock.calls[0] as [string, Record<string, unknown>];
+    const callArgs = mockQueueAdd.mock.calls[0] as unknown[];
+    const jobData = callArgs[1] as Record<string, unknown>;
     expect(jobData.tripId).toBe(TRIP_ID);
     expect(jobData.versionId).toBe(VERSION_ID);
     expect(jobData.markdownContent).toBe('# Barcelona Itinerary\n## Day 1\nSome content.');
