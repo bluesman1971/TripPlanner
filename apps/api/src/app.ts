@@ -14,6 +14,8 @@ import { revisionRoutes } from './routes/revise';
 import { portalRoutes } from './routes/portal';
 import { unsubscribeRoutes } from './routes/unsubscribe';
 import { safeReqSerializer } from './lib/logger';
+import { getSupabase } from './lib/supabase';
+import { getRedis } from './lib/redis';
 
 export async function buildApp() {
   const app = Fastify({
@@ -90,8 +92,45 @@ export async function buildApp() {
   // Public — no Clerk auth; HMAC-signed token identifies the consultant
   await app.register(unsubscribeRoutes);
 
-  // Health check (no auth required)
+  // Liveness — always fast; confirms the process is running
   app.get('/health', async () => ({ status: 'ok' }));
+
+  // Readiness — confirms downstream dependencies are reachable
+  app.get('/ready', async (_req, reply) => {
+    const checks: Record<string, string> = {};
+    let ready = true;
+
+    try {
+      const { error } = await Promise.race([
+        getSupabase().from('consultants').select('id').limit(1),
+        new Promise<{ error: Error }>((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), 3000),
+        ),
+      ]);
+      checks.supabase = error ? 'fail' : 'ok';
+      if (error) ready = false;
+    } catch {
+      checks.supabase = 'fail';
+      ready = false;
+    }
+
+    try {
+      const pong = await Promise.race([
+        getRedis().ping(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), 3000),
+        ),
+      ]);
+      checks.redis = pong === 'PONG' ? 'ok' : 'fail';
+      if (pong !== 'PONG') ready = false;
+    } catch {
+      checks.redis = 'fail';
+      ready = false;
+    }
+
+    const status = ready ? 200 : 503;
+    return reply.status(status).send({ status: ready ? 'ready' : 'degraded', checks });
+  });
 
   return app;
 }
