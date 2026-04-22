@@ -267,7 +267,7 @@ to `content` to match application code.
 | `20260420000004_itinerary_versions_token_columns.sql` | Add input_tokens, output_tokens, model_used to itinerary_versions | ✅ Run |
 | `20260421000005_portal_tokens.sql` | portal_tokens table for shareable client links | ✅ Run |
 | `20260421000006_consultant_email_notifications.sql` | adds `email_notifications boolean DEFAULT true` to consultants | ✅ Run |
-| `20260422000007_add_fk_indexes.sql` | FK indexes on bookings, itinerary_versions, research_notes, trip_brief, documents, trips, clients | ⏳ Pending |
+| `20260422000007_add_fk_indexes.sql` | FK indexes on bookings, itinerary_versions, research_notes, trip_brief, documents, trips, clients | ✅ Run |
 
 ---
 
