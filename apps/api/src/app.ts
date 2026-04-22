@@ -42,9 +42,29 @@ export async function buildApp() {
   // ── Rate limiting ─────────────────────────────────────────────────────────
   await app.register(rateLimit, {
     global: true,
-    max: 120,          // 120 requests per minute per IP
+    max: 120,          // 120 requests per minute per identity
     timeWindow: 60000, // 1 minute
     // Tighter limit on the upload endpoint is set at the route level
+    // Key by Clerk userId when authenticated so rate limit is per-consultant,
+    // not per-IP (which breaks multi-user NAT and is trivially bypassed by
+    // changing IP). We decode (but do not verify) the JWT to extract the sub —
+    // verification happens separately in requireAuth. Fall back to IP for
+    // unauthenticated or malformed requests.
+    keyGenerator: (req) => {
+      const auth = req.headers.authorization;
+      if (auth?.startsWith('Bearer ')) {
+        try {
+          const b64 = auth.slice(7).split('.')[1];
+          if (b64) {
+            const payload = JSON.parse(Buffer.from(b64, 'base64url').toString());
+            if (typeof payload.sub === 'string') return payload.sub;
+          }
+        } catch {
+          // malformed token — fall through to IP
+        }
+      }
+      return req.ip;
+    },
     errorResponseBuilder: () => ({
       error: 'Too many requests — please slow down',
       retryAfter: 60,
