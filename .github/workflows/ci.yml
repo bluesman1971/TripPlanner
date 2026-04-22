@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Typecheck · Lint · Test · Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (API)
+        run: pnpm --filter @trip-planner/api typecheck
+
+      - name: Typecheck (Web)
+        run: pnpm --filter @trip-planner/web typecheck
+
+      - name: Lint (API)
+        run: pnpm --filter @trip-planner/api lint
+
+      - name: Test (API)
+        run: pnpm --filter @trip-planner/api test --reporter=verbose
+        env:
+          # Encryption key format: 64 hex chars (256-bit). Safe dummy value for CI.
+          ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+          NODE_ENV: test
+
+      - name: Security audit (production deps only)
+        run: pnpm audit --prod
+        # Hard fail — prod deps are currently clean. Dev-only vulns (vitest/vite/esbuild)
+        # are filtered out by --prod so they don't trigger this step.
