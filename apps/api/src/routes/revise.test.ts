@@ -211,6 +211,30 @@ vi.mock('../lib/supabase', () => ({
         }),
       };
     },
+
+    rpc: (fn: string, args: Record<string, unknown>) => {
+      if (fn === 'insert_itinerary_version') {
+        const tripId = args.p_trip_id as string;
+        const existing = mockVersions.filter((v) => v.trip_id === tripId);
+        const nextVersion = existing.length > 0
+          ? Math.max(...existing.map((v) => v.version_number)) + 1
+          : 1;
+        const newVersion: VersionRow = {
+          id: `ver-${Date.now()}`,
+          trip_id: tripId,
+          version_number: nextVersion,
+          markdown_content: args.p_markdown as string,
+          docx_r2_key: null,
+          input_tokens: args.p_input_tokens as number,
+          output_tokens: args.p_output_tokens as number,
+          created_at: new Date().toISOString(),
+        };
+        mockVersions.push(newVersion);
+        mockInsertedVersions.push(newVersion);
+        return Promise.resolve({ data: nextVersion, error: null });
+      }
+      return Promise.resolve({ data: null, error: null });
+    },
   }),
 }));
 

@@ -71,7 +71,7 @@ export async function draftRoutes(app: FastifyInstance) {
       }
 
       // ── Fetch context ─────────────────────────────────────────────────────
-      const [briefResult, bookingsResult, researchResult, latestVersionResult] =
+      const [briefResult, bookingsResult, researchResult] =
         await Promise.all([
           supabase
             .from('trip_brief')
@@ -94,21 +94,12 @@ export async function draftRoutes(app: FastifyInstance) {
             .order('created_at', { ascending: false })
             .limit(1)
             .single(),
-
-          supabase
-            .from('itinerary_versions')
-            .select('version_number')
-            .eq('trip_id', tripId)
-            .order('version_number', { ascending: false })
-            .limit(1)
-            .single(),
         ]);
 
       const briefJson = (briefResult.data?.brief_json ?? {}) as Record<string, unknown>;
       const travelerProfile = briefJson.traveler_profile as Record<string, unknown> | undefined;
       const bookings = (bookingsResult.data ?? []) as Parameters<typeof buildDraftUserMessage>[0]['bookings'];
       const rawResearchContent = researchResult.data?.content ?? '';
-      const nextVersionNumber = ((latestVersionResult.data?.version_number as number | null) ?? 0) + 1;
 
       if (!rawResearchContent) {
         return reply.status(400).send({
@@ -165,16 +156,19 @@ export async function draftRoutes(app: FastifyInstance) {
         if (!sse.isAborted()) {
           const usage = await handle.getUsage();
 
-          await supabase
-            .from('itinerary_versions')
-            .insert({
-              trip_id: tripId,
-              version_number: nextVersionNumber,
-              markdown_content: fullContent,
-              input_tokens: usage.inputTokens,
-              output_tokens: usage.outputTokens,
-              model_used: usage.model,
-            });
+          // Atomic insert: advisory lock inside the function prevents concurrent
+          // requests from assigning the same version_number to this trip.
+          const { data: versionNumber, error: insertErr } = await supabase.rpc(
+            'insert_itinerary_version',
+            {
+              p_trip_id: tripId,
+              p_markdown: fullContent,
+              p_input_tokens: usage.inputTokens,
+              p_output_tokens: usage.outputTokens,
+              p_model_used: usage.model,
+            },
+          );
+          if (insertErr) throw insertErr;
 
           await supabase
             .from('trips')
@@ -185,10 +179,10 @@ export async function draftRoutes(app: FastifyInstance) {
           sendDraftReadyEmail(
             consultant,
             { id: tripId, destination: trip.destination as string },
-            nextVersionNumber,
+            versionNumber as number,
           );
 
-          sse.writeEvent({ type: 'done', versionNumber: nextVersionNumber });
+          sse.writeEvent({ type: 'done', versionNumber: versionNumber as number });
         }
 
       } catch (err) {
