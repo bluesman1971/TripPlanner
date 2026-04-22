@@ -1,8 +1,8 @@
 # TripPlanner — API Testing Report
 
-> Updated: Sprint 4 (Weeks 21–24: Email Notifications + Security Audit) | Prepared: 2026-04-21  
+> Updated: Sprint 4 (Security Audit Remediation — Batches 1 + 2 complete) | Prepared: 2026-04-21  
 > Reviewed by: Claude Code (Anthropic) on behalf of Tom Baker  
-> Status: **151 tests, all passing**
+> Status: **158 tests, all passing**
 
 ---
 
@@ -25,12 +25,13 @@ Tests cover three new route modules, each representing an AI pipeline phase:
 | `revise.ts` | Phase 7 — Itinerary revision | 25 |
 | `portal.ts` | Client Portal — token + view + PDF | 15 |
 | `trips.ts` | Core CRUD + DELETE trip | 6 |
-| `bookings.ts` | Booking CRUD (delete, manual, list) | 10 |
+| `bookings.ts` | Booking CRUD (delete, manual, list, job IDOR) | 16 |
+| `document.ts` | Document generation (async) + job trip cross-check | 31 |
 | `unsubscribe.ts` | Email opt-out endpoint | 6 |
 | `contextManager.ts` | Context budget utilities | 13 |
-| **Total** | | **151** |
+| **Total** | | **158** |
 
-> Route counts include new tests from Weeks 17–18 (usage logging, resume path), Weeks 19–20 (portal), the continued Weeks 19–20 session (booking management), Security Hardening Tier 2 (document async pattern + job status polling), and Weeks 21–22 (email unsubscribe). The contextManager unit tests are in `services/contextManager.test.ts`.
+> Route counts include new tests from Weeks 17–18 (usage logging, resume path), Weeks 19–20 (portal), the continued Weeks 19–20 session (booking management), Security Hardening Tier 2 (document async pattern + job status polling), Weeks 21–22 (email unsubscribe), and Security Audit Remediation (IDOR job cross-check, document trip ownership). The contextManager unit tests are in `services/contextManager.test.ts`.
 
 ---
 
@@ -101,8 +102,15 @@ IDOR is the highest-priority security concern for a multi-consultant SaaS: consu
 | `POST /document` | Trip ID that does not exist | 404 |
 | `GET /document` | Trip owned by another consultant | 404 |
 | `GET /document/download` | Trip owned by another consultant | 404 |
+| `GET /document/job/:jobId` | Trip owned by another consultant | 404 |
+| `GET /document/job/:jobId` | `job.data.tripId` doesn't match URL tripId | 404 |
+| `GET /trips/:tripId/bookings/job/:jobId` | Trip owned by another consultant | 404 |
+| `GET /trips/:tripId/bookings/job/:jobId` | `job.data.tripId` doesn't match | 404 |
+| `GET /trips/:tripId/bookings/job/:jobId` | `job.data.consultantId` doesn't match | 404 |
 
 **Why 404 not 403:** Returning 403 would confirm the resource exists, allowing enumeration. 404 is the correct response for both "not found" and "not yours".
+
+**BullMQ job ID enumeration:** BullMQ uses auto-incrementing integer job IDs by default. Without the `job.data` cross-check, an authenticated consultant could enumerate integer IDs and observe another consultant's job status. The cross-check ties every job to the specific trip and consultant that created it.
 
 ---
 
@@ -331,8 +339,9 @@ Three failures were encountered and resolved during this sprint. All are documen
 
 ### ~~No rate limiting on AI streaming endpoints~~ RESOLVED
 
-**Original gap:** Global 120 req/min limit allowed 120 AI calls per minute.  
-**Resolution (Tier 1):** Per-route rate limit of 5 req/min per IP on `/research/stream`, `/draft/stream`, `/revise/stream`. Set to 1000 in `NODE_ENV=test` to avoid test flapping. Uses Fastify per-route `config: { rateLimit: { max, timeWindow } }` syntax.
+**Original gap:** Global 120 req/min limit allowed 120 AI calls per minute per IP.  
+**Resolution (Tier 1):** Per-route rate limit of 5 req/min per identity on `/research/stream`, `/draft/stream`, `/revise/stream`. Set to 1000 in `NODE_ENV=test` to avoid test flapping. Uses Fastify per-route `config: { rateLimit: { max, timeWindow } }` syntax.  
+**Further hardened (Audit Batch 2):** Global rate limit is now keyed by JWT `sub` (decoded from Authorization header without verification) so limit is per-consultant, not per-IP. Falls back to IP for unauthenticated requests.
 
 ---
 
@@ -343,10 +352,10 @@ Three failures were encountered and resolved during this sprint. All are documen
 
 ---
 
-### SSE endpoints have no heartbeat
+### ~~SSE endpoints have no heartbeat~~ RESOLVED
 
-**Issue:** The research and draft streaming endpoints do not emit periodic keep-alive events. If AI generation is slow to produce the first chunk, proxies or load balancers with short idle timeouts may drop the connection.  
-**Recommendation:** Emit a `{ type: 'ping' }` event every 15 seconds until the first chunk arrives.
+**Original gap:** No keep-alive events on streaming endpoints.  
+**Resolution:** `lib/sse.ts` `startSSE()` starts a 15-second ping interval on every SSE connection. Interval is cleared on first chunk arrival and on close. All three streaming routes use `startSSE()`. SSE disconnect handling also added: `request.raw.on('close')` sets an abort flag; chunk loop checks `sse.isAborted()` and breaks; DB writes + email are inside `if (!sse.isAborted())`.
 
 ---
 
@@ -500,10 +509,6 @@ No new automated tests added in this session (bugs were in frontend logic and pr
 
 ---
 
-## 15. Summary
-
----
-
 ## 16. Weeks 21–22 New Tests (Email Unsubscribe)
 
 ### Unsubscribe route tests (`unsubscribe.test.ts`, 6 tests — new file)
@@ -549,12 +554,43 @@ SSRF surface: one location (`docxGenerator.ts` `fetchMapImage`). Hostname locked
 
 ---
 
+---
+
+## 18. Security Audit Remediation New Tests
+
+### Batch 1 — IDOR on BullMQ job polling
+
+**bookings.test.ts** — 6 new tests added to the existing 10 (total: 16):
+
+| Test | What it verifies |
+|---|---|
+| `GET /bookings/job/:jobId` — 401 unauthenticated | Auth required on job polling |
+| `GET /bookings/job/:jobId` — 404 when trip not owned | IDOR: trip ownership checked before job lookup |
+| `GET /bookings/job/:jobId` — 404 when job not found | Unknown jobId |
+| `GET /bookings/job/:jobId` — 404 when job.data.tripId doesn't match | Job belongs to different trip (integer job ID guessing) |
+| `GET /bookings/job/:jobId` — 404 when job.data.consultantId doesn't match | Job belongs to different consultant |
+| `GET /bookings/job/:jobId` — 200 happy path | Correct job + ownership returns status |
+
+**document.test.ts** — 1 new test added to the existing 30 (total: 31):
+
+| Test | What it verifies |
+|---|---|
+| `GET /document/job/:jobId` — 404 when job belongs to different trip | `job.data.tripId !== tripId` returns 404 |
+
+**Threat model:** BullMQ uses auto-incrementing integer job IDs. An authenticated consultant can enumerate integer IDs and poll another consultant's job. The fix cross-checks `job.data.tripId` and `job.data.consultantId` against the authenticated session after the trip ownership check.
+
+### Batch 2 — Mock updates for RPC pattern
+
+`draft.test.ts` and `revise.test.ts` mocks updated: `supabase.rpc('insert_itinerary_version', args)` intercepted and routes calls through the in-memory `mockItineraryVersions` / `mockVersions` array, returning the computed next version number. The old `from('itinerary_versions').insert()` mock is still present but no longer called by routes.
+
+---
+
 ## 15. Summary
 
 | Category | Count | Pass |
 |---|---|---|
-| Auth (401) tests | 13 | ✅ 13/13 |
-| IDOR prevention tests | 17 | ✅ 17/17 |
+| Auth (401) tests | 14 | ✅ 14/14 |
+| IDOR prevention tests | 22 | ✅ 22/22 |
 | Token validation tests (portal + unsubscribe) | 6 | ✅ 6/6 |
 | Gate / precondition tests | 10 | ✅ 10/10 |
 | Happy-path functional tests | 34 | ✅ 34/34 |
@@ -562,9 +598,9 @@ SSRF surface: one location (`docxGenerator.ts` `fetchMapImage`). Hostname locked
 | Usage logging tests | 3 | ✅ 3/3 |
 | Resume path tests | 3 | ✅ 3/3 |
 | Context manager unit tests | 13 | ✅ 13/13 |
-| Other (headers, content-type, versioning, side-effects, validation, job state, unsubscribe) | 41 | ✅ 41/41 |
-| **Total** | **151** | **✅ 151/151** |
+| Other (headers, content-type, versioning, side-effects, validation, job state, unsubscribe) | 42 | ✅ 42/42 |
+| **Total** | **158** | **✅ 158/158** |
 
-Failures during development: **6 total** — all resolved before merge. 3 from Weeks 13–16 (documented in section 8); 3 from Weeks 17–18 (mock call-count isolation). Weeks 19–20 (portal): zero failures on first run. Weeks 19–20 (booking management): zero failures on first run. Security Hardening Tiers 1 & 2: zero failures on first run. Weeks 21–22 (unsubscribe): zero failures on first run.  
+Failures during development: **6 total** — all resolved before merge. 3 from Weeks 13–16 (documented in section 8); 3 from Weeks 17–18 (mock call-count isolation). Weeks 19–20 (portal): zero failures on first run. Weeks 19–20 (booking management): zero failures on first run. Security Hardening Tiers 1 & 2: zero failures on first run. Weeks 21–22 (unsubscribe): zero failures on first run. Security Audit Remediation Batches 1+2: zero failures after mock updates for RPC pattern and rate limit keyGenerator fix.  
 Runtime bugs found by security audit: **2** — `getSupabase()` without import in `bookings.ts` (section 17); `ReturnType<typeof getSupabase>` type hole in `trips.ts` and `portal.ts` (section 17). Both resolved.  
 Critical production bug found: **1** — `research_notes` column name mismatch (section 9, first item). Resolved.

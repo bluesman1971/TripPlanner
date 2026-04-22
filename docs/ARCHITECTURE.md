@@ -275,12 +275,16 @@ to `content` to match application code.
 ## 6. API Routes
 
 Base URL: `http://localhost:3000`  
-All routes require `Authorization: Bearer {clerk_jwt}` except `/health`.
+All routes require `Authorization: Bearer {clerk_jwt}` except `/health`, `/ready`, `/portal/:token`, `/portal/:token/pdf`, and `/unsubscribe`.
 
-### Health
+### Health / Readiness
 ```
-GET  /health           → { status: 'ok' }
+GET  /health   → { status: 'ok' }                              (liveness — always fast, no downstream calls)
+GET  /ready    → { status: 'ready'|'degraded', checks: { supabase, redis } }
+               → 200 when all checks pass; 503 when any fail
 ```
+
+`/ready` performs a 3-second-timeout check of Supabase (single-row SELECT on consultants) and Redis (PING). Used by load-balancer readiness probes. `/health` is the liveness probe — never calls downstream deps.
 
 ### Clients
 ```
@@ -509,8 +513,13 @@ export const MODEL_CONFIG = {
 3. **Encrypted at rest.** `trip_brief` JSONB may contain allergy/medical data. `bookings.raw_text` and `bookings.allergy_flags` are encrypted before insert.
 4. **RLS on all tables.** Backend enforces additionally via `services/db.ts` scoped helpers. `getDB()` returns the service-role client; `getTripForConsultant(db, tripId, consultantId)` always filters by `clients.consultant_id`. Direct `lib/supabase` imports are banned in route handlers via ESLint `no-restricted-imports` (`apps/api/eslint.config.js`).
 5. **File upload whitelist.** `.pdf .docx .doc .html .htm .txt .md .jpg .jpeg .png .webp`, max 20 MB.
-6. **Helmet + rate limiting.** `@fastify/helmet` security headers; `@fastify/rate-limit` 120 req/min global; AI streaming endpoints (`/research/stream`, `/draft/stream`, `/revise/stream`) capped at 5 req/min per IP.
+6. **Helmet + rate limiting.** `@fastify/helmet` security headers; `@fastify/rate-limit` 120 req/min global **per-consultant** (keyed by JWT `sub` decoded from the Authorization header — falls back to IP for unauthenticated requests). AI streaming endpoints (`/research/stream`, `/draft/stream`, `/revise/stream`) capped at 5 req/min per identity.
 7. **No raw SQL.** Parameterized queries only via Supabase client.
+8. **Prompt injection framing.** All user-supplied and vendor-supplied content is wrapped in XML tags (`<client_notes>`, `<booking_data>`, `<research_notes>`, `<consultant_feedback>`, `<current_itinerary>`, `<untrusted_vendor_document>`) with a DATA BOUNDARY RULE in every system prompt instructing the model to treat tag contents as data, never as instructions.
+9. **PDF / HTML hardening.** `pdfGenerator.ts` sanitizes markdown→HTML via `sanitize-html` (strict allowlist; no script/img/iframe) before Chromium renders it. Puppeteer request interception aborts any outbound fetch that survives sanitization. CSP meta tag (`default-src 'none'; style-src 'unsafe-inline'`) as belt-and-suspenders.
+10. **Startup env validation.** `lib/validateEnv.ts` fails fast before `app.listen()` if any required env var is missing or malformed (ENCRYPTION_KEY must be 64-char hex; SUPABASE_URL must start with `https://`).
+11. **Atomic version numbering.** `itinerary_versions` version numbers are assigned by the `insert_itinerary_version()` Postgres function (migration 000008), which holds a per-trip `pg_advisory_xact_lock` for the duration of the transaction. Prevents duplicate version numbers under concurrent draft/revise requests.
+12. **CI pipeline.** `.github/workflows/ci.yml` — runs on every push/PR to main: install (frozen lockfile) → typecheck (API + web) → lint (API) → test (API) → `pnpm audit --prod` (hard fail; dev-only CVEs filtered by `--prod`).
 
 ---
 
@@ -606,7 +615,13 @@ apps/web/src/
 | Resend email — no-op without API key | `services/email.ts` checks for `RESEND_API_KEY` at send time and returns immediately if absent. This means emails silently do nothing in dev/test — correct behaviour, not a bug. Add the key to `.env` when ready to activate. |
 | Unsubscribe token uses ENCRYPTION_KEY | `lib/unsubscribeToken.ts` signs tokens with HMAC-SHA256 keyed on `ENCRYPTION_KEY`. Rotating `ENCRYPTION_KEY` invalidates all outstanding unsubscribe links. Use a dedicated `UNSUBSCRIBE_SECRET` env var if key rotation is required in future. |
 | Document generation timeout | Document generation (DOCX + Google Maps fetches) can take 8 s per map image × N days. Moved to BullMQ `document-generation` queue — POST returns 202 + jobId immediately; frontend polls GET /document/job/:jobId. Avoids reverse-proxy 30 s timeout. |
-| AI streaming rate limit | `/research/stream`, `/draft/stream`, `/revise/stream` are limited to 5 req/min per IP in production. In `NODE_ENV=test` the limit is set to 1000 to avoid flapping test counts. |
+| AI streaming rate limit | `/research/stream`, `/draft/stream`, `/revise/stream` are limited to 5 req/min per identity in production. In `NODE_ENV=test` the limit is set to 1000 to avoid flapping test counts. |
+| Rate limit key | Global rate limit is keyed by JWT `sub` (decoded without verification from the Authorization Bearer token) so limit is per-consultant, not per-IP. Falls back to IP for unauthenticated requests. `getAuth()` is NOT called in `keyGenerator` — doing so would consume `mockReturnValueOnce` values before auth middleware sees them. |
+| Prompt injection | Never pass raw user/vendor content directly into Claude prompts. Wrap in XML tags (`<client_notes>`, `<booking_data>`, `<untrusted_vendor_document>`, etc.) and include a DATA BOUNDARY RULE in the system prompt. See `services/bookingParser.ts`, `researchPrompt.ts`, `draftPrompt.ts`, `revisionPrompt.ts`. |
+| Puppeteer SSRF | `pdfGenerator.ts` uses `sanitize-html` to strip dangerous tags BEFORE Chromium sees the HTML. Request interception (`page.setRequestInterception(true)`) aborts any outbound fetch. Only `data:` URLs are allowed through (base64 inline images). |
+| `validateEnv` | `lib/validateEnv.ts` must be called before `buildApp()` in `index.ts`. It reads from `process.env` synchronously and throws with a descriptive message if any required var is missing or malformed. Required vars: `CLERK_SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `CLOUDFLARE_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `UPSTASH_REDIS_URL`, `ENCRYPTION_KEY`, `ANTHROPIC_API_KEY`, `CORS_ORIGIN`. |
+| `insert_itinerary_version` RPC | Call via `supabase.rpc('insert_itinerary_version', { p_trip_id, p_markdown, p_input_tokens, p_output_tokens, p_model_used })`. Returns the new `version_number` as an integer. Do NOT use `from('itinerary_versions').insert()` + manual version number — that pattern has a TOCTOU race. |
+| SSE helper | `lib/sse.ts` `startSSE(reply, request)` handles headers, hijack, ping timer, close listener, and abort flag. All streaming routes must use this instead of inline SSE setup. `sse.isAborted()` must be checked on every chunk; DB writes and emails must be inside `if (!sse.isAborted())`. |
 | Portal token expiry | Tokens default to 90 days after `trip.end_date`; if `end_date` is null, 90 days from token creation time (`NOW()`). Never use `created_at + 90d` — the trip may have been created months before the token. |
 | POST /document body schema | Fastify v5 validates `undefined` against a JSON Schema body definition and rejects it. Since `POST /trips/:id/document` never reads `request.body`, adding a body schema provides zero security benefit and breaks inject-based tests. Recommendation to add one was evaluated and declined. |
 | @tailwindcss/typography | Required for `prose` classes used in ResearchPanel markdown rendering. Install with `pnpm add @tailwindcss/typography` in `apps/web`, then add `@plugin "@tailwindcss/typography";` to `apps/web/src/index.css`. Tailwind v4 plugin syntax — not the v3 `plugins: [require(...)]` approach. |
@@ -633,7 +648,7 @@ Critical values that must not drift:
 pnpm dev                              # starts api + web concurrently via Turborepo
 pnpm --filter @trip-planner/api dev   # API only (port 3000)
 pnpm --filter @trip-planner/web dev   # Web only (port 5174)
-pnpm --filter @trip-planner/api test  # Vitest (151 tests across 9 files — all passing)
+pnpm --filter @trip-planner/api test  # Vitest (158 tests across 9 files — all passing)
 pnpm --filter @trip-planner/api lint  # ESLint — enforces no direct lib/supabase imports in routes
 pnpm --filter @trip-planner/api typecheck
 pnpm --filter @trip-planner/web typecheck
@@ -663,13 +678,15 @@ apps/api/src/
 ├── routes/
 │   ├── research.ts + research.test.ts   — Phase 3 SSE stream + GET   (18 tests)
 │   ├── draft.ts    + draft.test.ts      — Phase 5 SSE stream + GET   (26 tests)
-│   ├── document.ts + document.test.ts   — Phase 6 POST/job/GET/download (30 tests)
+│   ├── document.ts + document.test.ts   — Phase 6 POST/job/GET/download (31 tests)
 │   ├── revise.ts   + revise.test.ts     — Phase 7 SSE stream         (25 tests)
 │   ├── portal.ts   + portal.test.ts     — Client portal              (15 tests)
 │   ├── trips.ts    + trips.test.ts      — CRUD                        (6 tests)
 │   ├── clients.ts
-│   ├── bookings.ts + bookings.test.ts  — Booking CRUD               (10 tests)
+│   ├── bookings.ts + bookings.test.ts  — Booking CRUD               (16 tests)
 │   └── unsubscribe.ts + unsubscribe.test.ts — Email opt-out          (6 tests)
+├── services/
+│   ├── pdfGenerator.ts — sanitize-html + Puppeteer with request interception + CSP meta
 └── lib/
     ├── r2.ts          — uploadToR2, downloadFromR2ToTemp, deleteFromR2,
     │                    uploadDocxToR2, downloadR2AsBuffer
@@ -677,5 +694,7 @@ apps/api/src/
     ├── logger.ts      — safeError, safeReqSerializer, redact
     ├── supabase.ts    — service-role client singleton (use via services/db.ts in routes)
     ├── consultant.ts  — getOrCreateConsultant
-    └── redis.ts       — Upstash-compatible ioredis client
+    ├── redis.ts       — Upstash-compatible ioredis client
+    ├── validateEnv.ts — fail-fast startup check for all required env vars
+    └── sse.ts         — startSSE(); SSE headers, ping timer, close listener, abort flag
 ```

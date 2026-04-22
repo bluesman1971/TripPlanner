@@ -1,7 +1,7 @@
 # TripPlanner — Project Task List
 
 > Last updated: 2026-04-21  
-> Current position: Sprint 4, Weeks 21–24 complete (Email Notifications + Security Audit)  
+> Current position: Sprint 4, Security Audit remediation complete (all 10 items — Batches 1 + 2)  
 > Next task: Sprint 4 — Beta + Public Launch (Weeks 25–26)
 
 ---
@@ -238,8 +238,21 @@
 - [x] **Runtime bug fixed**: `bookings.ts:83` — `getSupabase()` called without import; would throw `ReferenceError` on every booking upload. Fixed to use `supabase` already in scope.
 - [x] **Type safety fixed**: `trips.ts:52` and `portal.ts:24` — `ReturnType<typeof getSupabase>` with unimported identifier resolved silently to `any`. Fixed to use `type DB` from `services/db.ts`.
 - [x] No TODO/FIXME/HACK comments found in codebase
-- [ ] **Deferred**: CI `pnpm audit` on every PR (no CI pipeline exists yet — addressed in Weeks 25–26)
 - [ ] **Deferred**: ClamAV / Cloudflare WAF file scanning (infrastructure dependency; low priority for solo-consultant tool)
+
+### Security Audit Remediation — Batch 1 (CRITICAL + HIGH infrastructure) ✅
+- [x] **CRITICAL-1**: BullMQ IDOR — job polling endpoints now cross-check `job.data.tripId` + `job.data.consultantId` against the authenticated consultant. Returns 404 (not 403) on mismatch. 6 new tests in `bookings.test.ts`, 1 new test in `document.test.ts`. (+7 tests)
+- [x] **CRITICAL-2**: Puppeteer SSRF hardening — `pdfGenerator.ts` sanitizes HTML via `sanitize-html` before Chromium render; request interception aborts outbound fetches; CSP meta tag; `--no-sandbox` gated to Windows + `PUPPETEER_NO_SANDBOX=true` env var.
+- [x] **HIGH-2**: SSE disconnect handling — extracted `lib/sse.ts` (`startSSE()`) with close listener + abort flag. All three streaming routes (`research.ts`, `draft.ts`, `revise.ts`) use `sse.isAborted()` per chunk; DB writes + email gated on `!sse.isAborted()`.
+- [x] **HIGH-4**: FK index migration — `20260422000007_add_fk_indexes.sql` adds compound indexes on all trip-scoped FK columns. ✅ Run.
+- [x] **MEDIUM-2**: Startup env validation — `lib/validateEnv.ts` fails fast with descriptive error before `app.listen()` if any required env var is missing or malformed.
+- [x] **CI pipeline** — `.github/workflows/ci.yml`: install → typecheck (API+web) → lint (API) → test (API) → `pnpm audit --prod` (hard fail). Resolves the deferred CI audit item.
+
+### Security Audit Remediation — Batch 2 (prompt injection + race + health) ✅
+- [x] **HIGH-1**: Prompt injection framing — all 4 prompt builders (`bookingParser.ts`, `researchPrompt.ts`, `draftPrompt.ts`, `revisionPrompt.ts`) wrap user/vendor content in XML tags with DATA BOUNDARY RULE in every system prompt.
+- [x] **HIGH-3**: Per-consultant rate limiting — `keyGenerator` in `app.ts` decodes JWT `sub` from Authorization header (without verification) to key rate limit per-consultant; falls back to IP for unauthenticated requests.
+- [x] **MEDIUM-1**: Version number race — replaced SELECT MAX + INSERT with `insert_itinerary_version()` Postgres function (`pg_advisory_xact_lock` per trip). Migration `20260422000008_insert_itinerary_version_fn.sql`. ✅ Run. Draft + revise routes call via `supabase.rpc()`.
+- [x] **MEDIUM-4**: Deep health check — `/health` liveness (always fast, no deps); `/ready` readiness (3s timeout checks on Supabase single-row SELECT + Redis PING; returns 503 + per-service status on failure).
 
 ### Weeks 25–26: Beta + Public Launch
 - [ ] Staging environment (separate Supabase project + R2 bucket)
@@ -256,10 +269,13 @@
 **Supabase migrations — all applied:**
 - `20260421000005_portal_tokens.sql` ✅
 - `20260421000006_consultant_email_notifications.sql` ✅
+- `20260422000007_add_fk_indexes.sql` ✅
+- `20260422000008_insert_itinerary_version_fn.sql` ✅
 
-**Current test suite:** 151 tests across 9 files, all passing.  
+**Current test suite:** 158 tests across 9 files, all passing.  
 Run with: `pnpm --filter @trip-planner/api test`  
-Lint: `pnpm --filter @trip-planner/api lint`
+Lint: `pnpm --filter @trip-planner/api lint`  
+CI: `.github/workflows/ci.yml` — runs on every push/PR to main.
 
 **Known outstanding issue:** Delete trip button not confirmed working on pre-existing trips — test on a newly created trip before relying on it.
 
